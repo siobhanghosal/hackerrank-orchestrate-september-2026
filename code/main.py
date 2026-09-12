@@ -477,8 +477,17 @@ def future_explicit_flows(normalized: Iterable[NormalizedEvent], as_of: date) ->
     return flows
 
 
+def is_terminal_salary_record(item: NormalizedEvent) -> bool:
+    """A settled final/last payroll is explicit evidence that a prior salary stream ends."""
+    return (item.include_in_cash_flow and item.cash_date is not None
+            and item.source.category == "salary" and item.source.direction == "credit"
+            and re.search(r"\b(final|last)\b", item.source.description, re.IGNORECASE) is not None
+            and re.search(r"\b(payroll|salary|pay)\b", item.source.description, re.IGNORECASE) is not None)
+
+
 def recurring_rules(normalized: Iterable[NormalizedEvent], as_of: date, resolution: EvidenceResolution | None = None) -> list[RecurringRule]:
     """Infer recurrence only from 3+ settled events with the same recurring obligation."""
+    normalized = tuple(normalized)
     groups: dict[tuple[str, str, str], list[NormalizedEvent]] = defaultdict(list)
     for item in normalized:
         event = item.source
@@ -513,6 +522,10 @@ def recurring_rules(normalized: Iterable[NormalizedEvent], as_of: date, resoluti
             next_date += timedelta(days=typical_interval)
         evidence_sources: tuple[str, ...] = ()
         if category == "salary" and direction == "credit" and resolution is not None:
+            terminal_records = [item for item in normalized if is_terminal_salary_record(item)
+                                and last_date < item.cash_date <= as_of]
+            if terminal_records:
+                continue
             salary_facts = [fact for fact in resolution.facts_for_salary() if fact.effective_date <= as_of + timedelta(days=FORECAST_DAYS)]
             removal = [fact for fact in salary_facts if fact.action == "remove_salary" and fact.effective_date <= next_date]
             if removal:
@@ -1139,6 +1152,11 @@ def trace_request(dataset: Dataset, request: Request) -> str:
         lines.extend(["", "## Evidence resolutions", ""])
         lines.extend(f"- `{fact.source_id}`: `{fact.action}` effective {fact.effective_date}; {fact.reason}." for fact in applied_facts)
         lines.extend(f"- `{item.source.event_id}`: {'included' if item.include_in_cash_flow else 'excluded'} by `{', '.join(item.evidence_sources)}` under {item.reason}." for item in evidence_overrides)
+    terminal_records = [item for item in normalized if is_terminal_salary_record(item) and item.cash_date <= request.request_date]
+    if terminal_records:
+        lines.extend(["", "## Explicit terminal income records", ""])
+        lines.extend(f"- `{item.source.event_id}` on {item.cash_date}: {item.source.description}; "
+                     "suppresses a prior inferred salary stream after this settled final payment." for item in terminal_records)
     profile = dataset.profiles[request.user_id]
     base_result = simulate_cash_flow(profile, flows, request.request_date)
     safe_amount = min(request.requested_amount, max(MONEY_ZERO, base_result.minimum_balance - profile.minimum_balance_to_keep))
