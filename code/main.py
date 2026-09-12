@@ -753,13 +753,95 @@ def earliest_safe_full_payment(dataset: Dataset, request: Request, base: Sequenc
     return None
 
 
+@dataclass(frozen=True)
+class PaymentCandidate:
+    """One safe, permitted no-change plan, ranked only by the published selector order."""
+    status: str
+    method: str
+    schedule: tuple[tuple[date, Decimal], ...]
+    earliest_full_date: date | None
+    payment_option_id: str | None
+    explanation: str
+
+    @property
+    def total_paid(self) -> Decimal:
+        return sum((amount for _, amount in self.schedule), MONEY_ZERO)
+
+    @property
+    def completion_date(self) -> date:
+        return self.schedule[-1][0]
+
+    @property
+    def start_date(self) -> date:
+        return self.schedule[0][0]
+
+
+def candidate_rank(candidate: PaymentCandidate, request: Request) -> tuple[object, ...]:
+    """Literal `Choosing Between Safe Plans` order; all candidates here need no changes."""
+    return (
+        candidate.completion_date > request.desired_completion_date,
+        False,  # This no-change selector never attaches spending changes.
+        candidate.total_paid,
+        candidate.start_date,
+        len(candidate.schedule),
+        candidate.payment_option_id or "",
+    )
+
+
+def choose_payment_candidate(candidates: Sequence[PaymentCandidate], request: Request) -> PaymentCandidate | None:
+    return min(candidates, key=lambda candidate: candidate_rank(candidate, request), default=None)
+
+
+def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Sequence[CashFlow],
+                       safe_amount: Decimal, earliest: date | None) -> list[PaymentCandidate]:
+    """Construct all eligible safe no-change plans before applying the selector."""
+    profile = dataset.profiles[request.user_id]
+    candidates: list[PaymentCandidate] = []
+
+    full_schedule = ((request.request_date, request.requested_amount),)
+    if "full_payment" in profile.payment_methods and is_safe(simulate_cash_flow(
+            profile, [*baseline_flows, *plan_flows(full_schedule)], request.request_date), profile):
+        option_ids = sorted(option.payment_option_id for option in dataset.payment_options.get(request.request_id, ())
+                            if option.payment_method == "full_payment" and schedule_matches_option(full_schedule, option))
+        candidates.append(PaymentCandidate("affordable_now", "full_payment", full_schedule, request.request_date,
+                                           option_ids[0] if option_ids else None,
+                                           "Baseline forecast keeps the balance above the minimum after full payment."))
+
+    if "installments" in profile.payment_methods:
+        for option in dataset.payment_options.get(request.request_id, ()):
+            schedule = tuple(payment_schedule(option))
+            if (option.payment_method != "installments" or not schedule
+                    or (profile.max_installment_months is not None and option.number_of_payments > profile.max_installment_months)
+                    or schedule[-1][0] > request.desired_completion_date):
+                continue
+            if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
+                candidates.append(PaymentCandidate("affordable_with_plan", "installments", schedule, earliest,
+                                                   option.payment_option_id,
+                                                   f"Baseline selected supplied installment option {option.payment_option_id}."))
+
+    if (request.allows_partial_payment and "partial_payment" in profile.payment_methods
+            and MONEY_ZERO < safe_amount < request.requested_amount and earliest is not None
+            and earliest <= request.desired_completion_date):
+        schedule = ((request.request_date, safe_amount), (earliest, request.requested_amount - safe_amount))
+        if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
+            candidates.append(PaymentCandidate("affordable_with_plan", "partial_payment", schedule, earliest, None,
+                                               "Baseline splits the request across two safe payments."))
+
+    if (earliest is not None and request.request_date < earliest <= request.desired_completion_date
+            and "full_payment" in profile.payment_methods):
+        schedule = ((earliest, request.requested_amount),)
+        if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
+            candidates.append(PaymentCandidate("affordable_later", "wait", schedule, earliest, None,
+                                               "Baseline forecast finds a later safe full-payment date."))
+    return candidates
+
+
 def predict_no_change(dataset: Dataset, request: Request) -> dict[str, str]:
     """A deliberately small generic policy used only to exercise the foundation."""
     profile = dataset.profiles[request.user_id]
     _, baseline_flows, _ = base_flows(dataset, request)
     base_result = simulate_cash_flow(profile, baseline_flows, request.request_date)
     safe_amount = min(request.requested_amount, max(MONEY_ZERO, base_result.minimum_balance - profile.minimum_balance_to_keep))
-    full_today = simulate_cash_flow(profile, [*baseline_flows, *plan_flows([(request.request_date, request.requested_amount)])], request.request_date)
     earliest = earliest_safe_full_payment(dataset, request, baseline_flows)
     none = {
         "request_id": request.request_id,
@@ -771,41 +853,12 @@ def predict_no_change(dataset: Dataset, request: Request) -> dict[str, str]:
         "spending_changes_needed": "none",
         "decision_explanation": "",
     }
-    if is_safe(full_today, profile) and "full_payment" in profile.payment_methods:
-        return {**none, "affordability_status": "affordable_now", "recommended_payment_method": "full_payment",
-                "payment_plan": f"{request.request_date.isoformat()}:{money_text(request.requested_amount)}",
-                "earliest_date_for_full_payment": request.request_date.isoformat(),
-                "decision_explanation": "Baseline forecast keeps the balance above the minimum after full payment."}
-    eligible_installments: list[tuple[PaymentOption, list[tuple[date, Decimal]]]] = []
-    if "installments" in profile.payment_methods:
-        for option in dataset.payment_options.get(request.request_id, ()):
-            schedule = payment_schedule(option)
-            if option.payment_method != "installments" or not schedule:
-                continue
-            if (profile.max_installment_months is not None and option.number_of_payments > profile.max_installment_months) or schedule[-1][0] > request.desired_completion_date:
-                continue
-            result = simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date)
-            if is_safe(result, profile):
-                eligible_installments.append((option, schedule))
-    if eligible_installments:
-        option, schedule = min(eligible_installments, key=lambda pair: (pair[0].total_payable_amount, len(pair[1]), pair[0].payment_option_id))
-        return {**none, "affordability_status": "affordable_with_plan", "recommended_payment_method": "installments",
-                "payment_plan": "|".join(f"{day.isoformat()}:{money_text(amount)}" for day, amount in schedule),
-                "earliest_date_for_full_payment": earliest.isoformat() if earliest else "",
-                "decision_explanation": f"Baseline selected supplied installment option {option.payment_option_id}."}
-    if (request.allows_partial_payment and "partial_payment" in profile.payment_methods and MONEY_ZERO < safe_amount < request.requested_amount
-            and earliest is not None and earliest <= request.desired_completion_date):
-        schedule = [(request.request_date, safe_amount), (earliest, request.requested_amount - safe_amount)]
-        if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
-            return {**none, "affordability_status": "affordable_with_plan", "recommended_payment_method": "partial_payment",
-                    "payment_plan": "|".join(f"{day.isoformat()}:{money_text(amount)}" for day, amount in schedule),
-                    "earliest_date_for_full_payment": earliest.isoformat(),
-                    "decision_explanation": "Baseline splits the request across two safe payments."}
-    if earliest is not None and earliest <= request.desired_completion_date and "full_payment" in profile.payment_methods:
-        return {**none, "affordability_status": "affordable_later", "recommended_payment_method": "wait",
-                "payment_plan": f"{earliest.isoformat()}:{money_text(request.requested_amount)}",
-                "earliest_date_for_full_payment": earliest.isoformat(),
-                "decision_explanation": "Baseline forecast finds a later safe full-payment date."}
+    selected = choose_payment_candidate(payment_candidates(dataset, request, baseline_flows, safe_amount, earliest), request)
+    if selected is not None:
+        return {**none, "affordability_status": selected.status, "recommended_payment_method": selected.method,
+                "payment_plan": "|".join(f"{day.isoformat()}:{money_text(amount)}" for day, amount in selected.schedule),
+                "earliest_date_for_full_payment": selected.earliest_full_date.isoformat() if selected.earliest_full_date else "",
+                "decision_explanation": selected.explanation}
     return {**none, "affordability_status": "not_affordable", "recommended_payment_method": "not_recommended",
             "earliest_date_for_full_payment": "", "decision_explanation": "Baseline found no eligible safe plan within 90 days."}
 
@@ -1086,12 +1139,27 @@ def trace_request(dataset: Dataset, request: Request) -> str:
         lines.extend(["", "## Evidence resolutions", ""])
         lines.extend(f"- `{fact.source_id}`: `{fact.action}` effective {fact.effective_date}; {fact.reason}." for fact in applied_facts)
         lines.extend(f"- `{item.source.event_id}`: {'included' if item.include_in_cash_flow else 'excluded'} by `{', '.join(item.evidence_sources)}` under {item.reason}." for item in evidence_overrides)
+    profile = dataset.profiles[request.user_id]
+    base_result = simulate_cash_flow(profile, flows, request.request_date)
+    safe_amount = min(request.requested_amount, max(MONEY_ZERO, base_result.minimum_balance - profile.minimum_balance_to_keep))
+    earliest = earliest_safe_full_payment(dataset, request, flows)
+    candidates = payment_candidates(dataset, request, flows, safe_amount, earliest)
+    selected = choose_payment_candidate(candidates, request)
+    lines.extend(["", "## Safe no-change payment candidates", ""])
+    if candidates:
+        for candidate in sorted(candidates, key=lambda candidate: candidate_rank(candidate, request)):
+            rank = candidate_rank(candidate, request)
+            option = candidate.payment_option_id or "no supplied option"
+            lines.append(f"- `{candidate.method}`: completes {candidate.completion_date}, starts {candidate.start_date}, "
+                         f"total {money_text(candidate.total_paid)}, payments {len(candidate.schedule)}, option {option}; "
+                         f"selector rank {rank}{' — selected' if candidate == selected else ''}.")
+    else:
+        lines.append("- None; no safe permitted no-change payment candidate completes by the desired date.")
     spending = plan_spending_changes(dataset, request, predict_no_change(dataset, request))
     lines.extend(["", "## Authorized spending-change search", ""])
     lines.extend(f"- {note}" for note in spending.notes)
     lines.append(f"- Candidate/guard simulations: {spending.simulations}.")
-    base = simulate_cash_flow(dataset.profiles[request.user_id], flows, request.request_date)
-    lines.extend(["", "## Baseline 90-day result", "", f"- Minimum projected balance before this request: {money_text(base.minimum_balance)} on {base.minimum_balance_date}."])
+    lines.extend(["", "## Baseline 90-day result", "", f"- Minimum projected balance before this request: {money_text(base_result.minimum_balance)} on {base_result.minimum_balance_date}."])
     return "\n".join(lines) + "\n"
 
 
