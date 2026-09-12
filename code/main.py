@@ -192,13 +192,40 @@ class EvidenceResolution:
 
 
 @dataclass(frozen=True)
-class CashFlow:
+class ForecastFlow:
+    """Canonical immutable cash movement consumed by the 90-day simulator."""
+
     flow_date: date
     amount: Decimal
     source_id: str
     category: str
     description: str
     kind: str  # explicit, recurring, or requested_payment
+    source_event_ids: tuple[str, ...] = ()
+    evidence_sources: tuple[str, ...] = ()
+    trace_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.amount, Decimal) or not self.amount.is_finite():
+            raise DatasetError("ForecastFlow.amount must be a finite Decimal")
+        if not self.source_id:
+            raise DatasetError("ForecastFlow.source_id must not be blank")
+
+    @property
+    def direction(self) -> str:
+        return "debit" if self.amount < MONEY_ZERO else "credit"
+
+
+def forecast_flow_order_key(flow: ForecastFlow) -> tuple[object, ...]:
+    """Conservative total order: date, debits before credits, then stable provenance."""
+    return (
+        flow.flow_date,
+        0 if flow.amount < MONEY_ZERO else 1,
+        flow.source_id,
+        flow.kind,
+        flow.category,
+        flow.amount,
+    )
 
 
 @dataclass(frozen=True)
@@ -214,13 +241,28 @@ class RecurringRule:
     evidence_sources: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class LedgerStep:
+    sequence: int
+    flow: ForecastFlow
+    opening_balance: Decimal
+    closing_balance: Decimal
+
+
 @dataclass
 class SimulationResult:
     ending_balance: Decimal
     minimum_balance: Decimal
     minimum_balance_date: date
     daily_balances: dict[date, Decimal]
-    applied_flows: list[CashFlow]
+    ledger_steps: tuple[LedgerStep, ...]
+
+    @property
+    def applied_flows(self) -> tuple[ForecastFlow, ...]:
+        return tuple(step.flow for step in self.ledger_steps)
+
+    def first_breach(self, threshold: Decimal) -> LedgerStep | None:
+        return next((step for step in self.ledger_steps if step.closing_balance < threshold), None)
 
     @property
     def is_safe(self) -> bool:
@@ -487,14 +529,18 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
     return normalized
 
 
-def future_explicit_flows(normalized: Iterable[NormalizedEvent], as_of: date) -> list[CashFlow]:
-    flows: list[CashFlow] = []
+def future_explicit_flows(normalized: Iterable[NormalizedEvent], as_of: date) -> list[ForecastFlow]:
+    flows: list[ForecastFlow] = []
     for item in normalized:
         event = item.source
         if not item.include_in_cash_flow or item.cash_date is None or item.cash_date <= as_of or item.amount_home is None:
             continue
         signed_amount = item.amount_home if event.direction == "credit" else -item.amount_home
-        flows.append(CashFlow(item.cash_date, signed_amount, event.event_id, event.category, event.description, "explicit"))
+        flows.append(ForecastFlow(
+            item.cash_date, signed_amount, event.event_id, event.category, event.description, "explicit",
+            source_event_ids=(event.event_id,), evidence_sources=item.evidence_sources,
+            trace_reason=item.reason,
+        ))
     return flows
 
 
@@ -579,15 +625,19 @@ def recurring_rules(normalized: Iterable[NormalizedEvent], as_of: date, resoluti
     return rules
 
 
-def recurring_flows(rules: Iterable[RecurringRule], as_of: date, horizon_days: int) -> list[CashFlow]:
+def recurring_flows(rules: Iterable[RecurringRule], as_of: date, horizon_days: int) -> list[ForecastFlow]:
     horizon = as_of + timedelta(days=horizon_days)
-    flows: list[CashFlow] = []
+    flows: list[ForecastFlow] = []
     for rule in rules:
         flow_date = rule.next_date
         while flow_date <= horizon:
             signed_amount = rule.amount if rule.direction == "credit" else -rule.amount
-            flows.append(CashFlow(flow_date, signed_amount, f"recurring:{rule.category}", rule.category,
-                                  f"Inferred recurring {rule.description}", "recurring"))
+            flows.append(ForecastFlow(
+                flow_date, signed_amount, f"recurring:{rule.category}", rule.category,
+                f"Inferred recurring {rule.description}", "recurring",
+                source_event_ids=rule.source_event_ids, evidence_sources=rule.evidence_sources,
+                trace_reason=f"history supports a fixed {rule.interval_days}-day recurrence",
+            ))
             flow_date += timedelta(days=rule.interval_days)
     return flows
 
@@ -595,41 +645,42 @@ def recurring_flows(rules: Iterable[RecurringRule], as_of: date, horizon_days: i
 @dataclass(frozen=True)
 class RecurrenceReconciliation:
     """Audit-only representation after the rejected hybrid candidate was reverted."""
-    generated_before: tuple[CashFlow, ...]
-    generated_after: tuple[CashFlow, ...]
+    generated_before: tuple[ForecastFlow, ...]
+    generated_after: tuple[ForecastFlow, ...]
     suppressions: tuple[object, ...] = ()
 
 
-def reconcile_recurring_flows(rules: Sequence[RecurringRule], explicit_flows: Sequence[CashFlow], as_of: date, horizon_days: int) -> RecurrenceReconciliation:
+def reconcile_recurring_flows(rules: Sequence[RecurringRule], explicit_flows: Sequence[ForecastFlow], as_of: date, horizon_days: int) -> RecurrenceReconciliation:
     """Current active policy has no explicit-event suppression; retained for audit compatibility."""
     generated = tuple(recurring_flows(rules, as_of, horizon_days))
     return RecurrenceReconciliation(generated, generated)
 
 
-def simulate_cash_flow(profile: Profile, flows: Iterable[CashFlow], as_of: date, horizon_days: int = FORECAST_DAYS) -> SimulationResult:
-    """Run a daily forecast, processing debits before credits on each date conservatively."""
+def simulate_cash_flow(profile: Profile, flows: Iterable[ForecastFlow], as_of: date, horizon_days: int = FORECAST_DAYS) -> SimulationResult:
+    """Run a daily forecast using the documented total order for same-day flows."""
     horizon = as_of + timedelta(days=horizon_days)
-    by_day: dict[date, list[CashFlow]] = defaultdict(list)
+    by_day: dict[date, list[ForecastFlow]] = defaultdict(list)
     for flow in flows:
         if as_of <= flow.flow_date <= horizon:
             by_day[flow.flow_date].append(flow)
     balance = profile.current_available_balance
     lowest, lowest_date = balance, as_of
     balances: dict[date, Decimal] = {}
-    applied: list[CashFlow] = []
+    steps: list[LedgerStep] = []
     current_day = as_of
     while current_day <= horizon:
-        for flow in sorted(by_day[current_day], key=lambda item: (item.amount >= MONEY_ZERO, item.source_id)):
+        for flow in sorted(by_day[current_day], key=forecast_flow_order_key):
+            opening = balance
             balance += flow.amount
-            applied.append(flow)
+            steps.append(LedgerStep(len(steps) + 1, flow, opening, balance))
             if balance < lowest:
                 lowest, lowest_date = balance, current_day
         balances[current_day] = balance
         current_day += timedelta(days=1)
-    return SimulationResult(balance, lowest, lowest_date, balances, applied)
+    return SimulationResult(balance, lowest, lowest_date, balances, tuple(steps))
 
 
-def base_flows(dataset: Dataset, request: Request) -> tuple[list[NormalizedEvent], list[CashFlow], list[RecurringRule]]:
+def base_flows(dataset: Dataset, request: Request) -> tuple[list[NormalizedEvent], list[ForecastFlow], list[RecurringRule]]:
     resolution = resolve_evidence(dataset, request.user_id)
     normalized = normalize_events(dataset, request.user_id, resolution)
     explicit = future_explicit_flows(normalized, request.request_date)
@@ -650,8 +701,11 @@ def payment_schedule(option: PaymentOption) -> list[tuple[date, Decimal]]:
             for index in range(option.number_of_payments)]
 
 
-def plan_flows(schedule: Iterable[tuple[date, Decimal]]) -> list[CashFlow]:
-    return [CashFlow(day, -amount, "request_payment", "requested_payment", "Requested payment", "requested_payment")
+def plan_flows(schedule: Iterable[tuple[date, Decimal]]) -> list[ForecastFlow]:
+    return [ForecastFlow(
+        day, -amount, "request_payment", "requested_payment", "Requested payment", "requested_payment",
+        trace_reason="candidate payment from the selected request plan",
+    )
             for day, amount in schedule]
 
 
@@ -787,7 +841,7 @@ def validate_output_rows(rows: Sequence[Mapping[str, str]], dataset: Dataset, re
     return errors
 
 
-def earliest_safe_full_payment(dataset: Dataset, request: Request, base: Sequence[CashFlow]) -> date | None:
+def earliest_safe_full_payment(dataset: Dataset, request: Request, base: Sequence[ForecastFlow]) -> date | None:
     profile = dataset.profiles[request.user_id]
     for offset in range(FORECAST_DAYS + 1):
         day = request.request_date + timedelta(days=offset)
@@ -836,7 +890,7 @@ def choose_payment_candidate(candidates: Sequence[PaymentCandidate], request: Re
     return min(candidates, key=lambda candidate: candidate_rank(candidate, request), default=None)
 
 
-def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Sequence[CashFlow],
+def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Sequence[ForecastFlow],
                        safe_amount: Decimal, earliest: date | None) -> list[PaymentCandidate]:
     """Construct all eligible safe no-change plans before applying the selector."""
     profile = dataset.profiles[request.user_id]
@@ -928,7 +982,7 @@ class SpendingSearch:
     simulations: int = 0
 
 
-def eligible_spending_actions(dataset: Dataset, request: Request, flows: Sequence[CashFlow],
+def eligible_spending_actions(dataset: Dataset, request: Request, flows: Sequence[ForecastFlow],
                               rules: Sequence[RecurringRule]) -> list[SpendingAction]:
     """Map authorized source events to unambiguous existing generated occurrences."""
     profile = dataset.profiles[request.user_id]
@@ -966,8 +1020,8 @@ def eligible_spending_actions(dataset: Dataset, request: Request, flows: Sequenc
     return sorted(actions, key=lambda action: (action.event_id, action.kind))
 
 
-def apply_spending_actions(flows: Sequence[CashFlow], actions: Sequence[SpendingAction],
-                           request: Request) -> list[CashFlow]:
+def apply_spending_actions(flows: Sequence[ForecastFlow], actions: Sequence[SpendingAction],
+                           request: Request) -> list[ForecastFlow]:
     """Change only future generated debits; keep explicit events and all dates intact."""
     updated = list(flows)
     touched: set[int] = set()
@@ -981,7 +1035,11 @@ def apply_spending_actions(flows: Sequence[CashFlow], actions: Sequence[Spending
             if not action.new_amount.is_finite() or not MONEY_ZERO <= action.new_amount < -flow.amount:
                 raise DatasetError("Spending change is not a strict reduction")
             touched.add(index)
-            updated[index] = replace(flow, amount=-action.new_amount)
+            updated[index] = replace(
+                flow,
+                amount=-action.new_amount,
+                trace_reason=f"{flow.trace_reason}; authorized {action.serialize()}",
+            )
     return updated
 
 
@@ -1147,6 +1205,17 @@ def plan_spending_changes(dataset: Dataset, request: Request,
     return result
 
 
+def simulate_output_plan(dataset: Dataset, request: Request, output: Mapping[str, str]) -> SimulationResult:
+    """Re-simulate a serialized output through the same canonical ledger."""
+    profile = dataset.profiles[request.user_id]
+    _, flows, _ = base_flows(dataset, request)
+    schedule = parse_payment_plan(output["payment_plan"]) or []
+    if output["spending_changes_needed"] != "none":
+        actions = bind_spending_actions(output["spending_changes_needed"], dataset, request)
+        flows = apply_spending_actions(flows, actions, request)
+    return simulate_cash_flow(profile, [*flows, *plan_flows(schedule)], request.request_date)
+
+
 def explanation_packet(dataset: Dataset, request: Request, output: Mapping[str, str]) -> dict[str, object]:
     """Build the only model input from validated, typed decision facts.
 
@@ -1155,12 +1224,8 @@ def explanation_packet(dataset: Dataset, request: Request, output: Mapping[str, 
     unnecessary once the deterministic resolver has selected a decision.
     """
     profile = dataset.profiles[request.user_id]
-    _, flows, _ = base_flows(dataset, request)
     schedule = parse_payment_plan(output["payment_plan"]) or []
-    if output["spending_changes_needed"] != "none":
-        actions = bind_spending_actions(output["spending_changes_needed"], dataset, request)
-        flows = apply_spending_actions(flows, actions, request)
-    result = simulate_cash_flow(profile, [*flows, *plan_flows(schedule)], request.request_date)
+    result = simulate_output_plan(dataset, request, output)
     resolution = resolve_evidence(dataset, request.user_id)
     return {
         "request": {
@@ -1221,6 +1286,18 @@ def predict_baseline(dataset: Dataset, request: Request,
     return enrich_explanation(dataset, request, output, generator)
 
 
+def ledger_markdown_rows(result: SimulationResult) -> list[str]:
+    return [
+        f"| {step.sequence} | {step.flow.flow_date} | {step.flow.direction} | "
+        f"{money_text(step.flow.amount)} | {money_text(step.opening_balance)} | "
+        f"{money_text(step.closing_balance)} | `{step.flow.source_id}` | {step.flow.kind} | "
+        f"{', '.join(f'`{source}`' for source in step.flow.source_event_ids) or '-'} | "
+        f"{', '.join(f'`{source}`' for source in step.flow.evidence_sources) or '-'} | "
+        f"{markdown_cell(step.flow.trace_reason)} |"
+        for step in result.ledger_steps
+    ]
+
+
 def trace_request(dataset: Dataset, request: Request) -> str:
     """Produce an auditable Markdown trace without relying on solved sample labels."""
     normalized, flows, rules = base_flows(dataset, request)
@@ -1278,7 +1355,24 @@ def trace_request(dataset: Dataset, request: Request) -> str:
     lines.extend(["", "## Authorized spending-change search", ""])
     lines.extend(f"- {note}" for note in spending.notes)
     lines.append(f"- Candidate/guard simulations: {spending.simulations}.")
-    lines.extend(["", "## Baseline 90-day result", "", f"- Minimum projected balance before this request: {money_text(base_result.minimum_balance)} on {base_result.minimum_balance_date}."])
+    recommended_result = simulate_output_plan(dataset, request, spending.output)
+    baseline_breach = base_result.first_breach(profile.minimum_balance_to_keep)
+    selected_breach = recommended_result.first_breach(profile.minimum_balance_to_keep)
+    lines.extend([
+        "", "## Baseline 90-day result", "",
+        f"- Minimum projected balance before this request: {money_text(base_result.minimum_balance)} on {base_result.minimum_balance_date}.",
+        (f"- First minimum-balance breach: {baseline_breach.flow.flow_date} after `{baseline_breach.flow.source_id}` "
+         f"closed at {money_text(baseline_breach.closing_balance)}."
+         if baseline_breach else "- First minimum-balance breach: none."),
+        "", "## Ordered ledger for the recommended output", "",
+        "Same-day rule: debits first, then credits; ties use source ID, kind, category, and exact Decimal amount.", "",
+        "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason |",
+        "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
+        *(ledger_markdown_rows(recommended_result) or ["| - | - | - | - | - | - | - | - | - | - | No forecast flows |"]),
+        "",
+        (f"First recommended-plan breach: {selected_breach.flow.flow_date} after `{selected_breach.flow.source_id}`."
+         if selected_breach else "First recommended-plan breach: none."),
+    ])
     return "\n".join(lines) + "\n"
 
 
@@ -1418,6 +1512,96 @@ def sample_metrics(dataset: Dataset, predictions: Mapping[str, Mapping[str, str]
 
 def markdown_cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def build_ledger_delta_report(dataset: Dataset) -> str:
+    """Explain every structured sample mismatch from ledger and selector facts."""
+    predictions = {request_id: predict_baseline(dataset, request)
+                   for request_id, request in dataset.samples.items()}
+    matches, structured_failures = sample_metrics(dataset, predictions)
+    sections = [
+        "# Sample ledger delta report", "",
+        "This diagnostic uses solved sample fields only for expected/actual comparison. Prediction, ledger assembly, and candidate selection never read those labels.", "",
+        f"- Structured failures: **{structured_failures}/25**",
+        f"- Structured exact matches: **{sum(matches[field] for field in OUTPUT_COLUMNS[1:-1])}/175**", "",
+        "| Field | Exact matches |", "| --- | ---: |",
+        *(f"| `{field}` | {matches[field]}/25 |" for field in OUTPUT_COLUMNS[1:-1]), "",
+    ]
+    horizon_delta = timedelta(days=FORECAST_DAYS)
+    for request_id, request in dataset.samples.items():
+        actual = predictions[request_id]
+        expected = dataset.sample_labels[request_id]
+        differing = [field for field in OUTPUT_COLUMNS[1:-1]
+                     if not values_match(field, expected[field], actual[field])]
+        if not differing:
+            continue
+        profile = dataset.profiles[request.user_id]
+        normalized, flows, _ = base_flows(dataset, request)
+        baseline = simulate_cash_flow(profile, flows, request.request_date)
+        safe_amount = min(request.requested_amount,
+                          max(MONEY_ZERO, baseline.minimum_balance - profile.minimum_balance_to_keep))
+        earliest = earliest_safe_full_payment(dataset, request, flows)
+        candidates = payment_candidates(dataset, request, flows, safe_amount, earliest)
+        selected = choose_payment_candidate(candidates, request)
+        immediate_full = simulate_cash_flow(
+            profile,
+            [*flows, *plan_flows([(request.request_date, request.requested_amount)])],
+            request.request_date,
+        )
+        immediate_breach = immediate_full.first_breach(profile.minimum_balance_to_keep)
+        excluded_rows: list[str] = []
+        horizon = request.request_date + horizon_delta
+        for item in normalized:
+            if not item.include_in_cash_flow:
+                reason = item.reason
+            elif item.cash_date is None:
+                reason = "no usable cash date"
+            elif item.cash_date <= request.request_date:
+                reason = "already reflected in the current balance; may remain recurrence evidence"
+            elif item.cash_date > horizon:
+                reason = "cash date is outside the 90-day horizon"
+            else:
+                continue
+            excluded_rows.append(
+                f"| `{item.source.event_id}` | {item.cash_date or '-'} | {item.source.direction} | "
+                f"{money_text(item.amount_home) if item.amount_home is not None else '-'} | {markdown_cell(reason)} |"
+            )
+        candidate_rows = [
+            f"| {candidate.method} | {candidate.start_date} | {candidate.completion_date} | "
+            f"{money_text(candidate.total_paid)} | {len(candidate.schedule)} | "
+            f"`{candidate.payment_option_id or '-'}` | `{candidate_rank(candidate, request)}` | "
+            f"{'selected' if candidate == selected else 'safe, not selected'} |"
+            for candidate in sorted(candidates, key=lambda item: candidate_rank(item, request))
+        ]
+        sections.extend([
+            f"## {request_id} - {request.user_id}", "",
+            "### Expected versus actual", "",
+            "| Field | Expected | Actual |", "| --- | --- | --- |",
+            *(f"| `{field}` | {markdown_cell(expected[field])} | {markdown_cell(actual[field])} |"
+              for field in differing), "",
+            "### Balance diagnostics", "",
+            f"- Current balance: `{money_text(profile.current_available_balance)}` {profile.home_currency}",
+            f"- Required minimum: `{money_text(profile.minimum_balance_to_keep)}` {profile.home_currency}",
+            f"- Baseline minimum before request payment: `{money_text(baseline.minimum_balance)}` on `{baseline.minimum_balance_date}`",
+            f"- Computed safe amount now: `{money_text(safe_amount)}`",
+            f"- Computed earliest safe full-payment date: `{earliest or ''}`",
+            (f"- Immediate-full first breach: `{immediate_breach.flow.flow_date}` after `{immediate_breach.flow.source_id}`, "
+             f"closing at `{money_text(immediate_breach.closing_balance)}`"
+             if immediate_breach else "- Immediate-full first breach: none"), "",
+            "### Included 90-day forecast ledger", "",
+            "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason |",
+            "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
+            *(ledger_markdown_rows(baseline) or ["| - | - | - | - | - | - | - | - | - | - | No forecast flows |"]), "",
+            "### Excluded source events", "",
+            "| Event | Cash date | Direction | Home amount | Reason |",
+            "| --- | --- | --- | ---: | --- |",
+            *(excluded_rows or ["| - | - | - | - | None |"]), "",
+            "### Safe no-change plan candidates", "",
+            "| Method | Start | Complete | Total | Payments | Option | Selector rank | Result |",
+            "| --- | --- | --- | ---: | ---: | --- | --- | --- |",
+            *(candidate_rows or ["| - | - | - | - | - | - | - | No eligible safe candidate |"]), "",
+        ])
+    return "\n".join(sections).rstrip() + "\n"
 
 
 def excluded_event_reason(item: NormalizedEvent, request: Request) -> str:
@@ -1563,6 +1747,8 @@ def main() -> None:
     parser.add_argument("--write-discrepancy-report", type=Path, help="Audit an existing sample prediction CSV without running prediction.")
     parser.add_argument("--check-evidence-regressions", action="store_true", help="Run generic evidence-resolution invariants on public sample contexts.")
     parser.add_argument("--write-recurrence-audit", type=Path, help="Write cadence and explicit-event reconciliation audit for sample contexts.")
+    parser.add_argument("--write-ledger-delta-report", type=Path,
+                        help="Write per-request ledger and selector diagnostics for mismatched public samples.")
     parser.add_argument("--llm-provider", choices=("none", "ollama"), default="none",
                         help="Optional explanation provider. Financial decisions always remain deterministic.")
     parser.add_argument("--ollama-model", default=os.environ.get("OLLAMA_MODEL", "qwen3:4b-instruct"),
@@ -1610,6 +1796,10 @@ def main() -> None:
         args.write_recurrence_audit.parent.mkdir(parents=True, exist_ok=True)
         args.write_recurrence_audit.write_text(build_recurrence_reconciliation_audit(dataset), encoding="utf-8", newline="\n")
         print(f"Wrote recurrence reconciliation audit: {args.write_recurrence_audit}")
+    if args.write_ledger_delta_report:
+        args.write_ledger_delta_report.parent.mkdir(parents=True, exist_ok=True)
+        args.write_ledger_delta_report.write_text(build_ledger_delta_report(dataset), encoding="utf-8", newline="\n")
+        print(f"Wrote sample ledger delta report: {args.write_ledger_delta_report}")
     if args.explain:
         request = dataset.samples.get(args.explain) or dataset.requests.get(args.explain)
         if request is None:
@@ -1631,7 +1821,8 @@ def main() -> None:
         args.write_usage_report.write_text(usage_report_markdown(generator.usages, invocation_requests), encoding="utf-8", newline="\n")
         print(f"Wrote model usage report: {args.write_usage_report}")
     if not (args.trace or args.evaluate_samples or args.write_discrepancy_report or args.check_evidence_regressions
-            or args.write_recurrence_audit or args.explain or args.write_output or args.write_usage_report):
+            or args.write_recurrence_audit or args.write_ledger_delta_report or args.explain or args.write_output
+            or args.write_usage_report):
         parser.print_help()
 
 
