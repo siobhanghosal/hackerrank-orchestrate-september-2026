@@ -41,6 +41,33 @@ Run the starter Python entry point with:
 python3 code/main.py
 ```
 
+### Optional local Ollama explanations
+
+The financial decision engine is deterministic: it calculates every amount,
+date, payment plan, and validation result in Python. A local Ollama model can
+optionally turn the already validated decision facts into the final
+`decision_explanation`; it cannot change any other output field.
+
+With Ollama running locally and `qwen3:4b-instruct` installed, produce final
+rows and the required run-specific usage report with:
+
+```bash
+python code/main.py --llm-provider ollama --write-output output.csv --write-usage-report code/evaluation/usage_report.md
+```
+
+To smoke-test one public sample without writing an output file:
+
+```bash
+python code/main.py --llm-provider ollama --explain request_01
+```
+
+Ollama is optional. Without `--llm-provider ollama`, the deterministic
+explanation is retained. If a local model is unavailable or returns malformed
+JSON, the same deterministic fallback is used and no calculated financial
+field changes. The final full-dataset command overwrites
+`code/evaluation/usage_report.md` with local input/output token counts and
+zero API cost.
+
 After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
 
 ## Important File Locations

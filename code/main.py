@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -19,6 +20,8 @@ from itertools import combinations, permutations
 from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Sequence
+
+from ollama_explanations import ExplanationError, ExplanationGenerator, OllamaExplanationGenerator, usage_report_markdown
 
 
 MONEY_ZERO = Decimal("0")
@@ -1144,8 +1147,78 @@ def plan_spending_changes(dataset: Dataset, request: Request,
     return result
 
 
-def predict_baseline(dataset: Dataset, request: Request) -> dict[str, str]:
-    return plan_spending_changes(dataset, request, predict_no_change(dataset, request)).output
+def explanation_packet(dataset: Dataset, request: Request, output: Mapping[str, str]) -> dict[str, object]:
+    """Build the only model input from validated, typed decision facts.
+
+    Raw request text, message text, image content, and unnormalized source rows
+    are deliberately absent.  They can contain untrusted instructions and are
+    unnecessary once the deterministic resolver has selected a decision.
+    """
+    profile = dataset.profiles[request.user_id]
+    _, flows, _ = base_flows(dataset, request)
+    schedule = parse_payment_plan(output["payment_plan"]) or []
+    if output["spending_changes_needed"] != "none":
+        actions = bind_spending_actions(output["spending_changes_needed"], dataset, request)
+        flows = apply_spending_actions(flows, actions, request)
+    result = simulate_cash_flow(profile, [*flows, *plan_flows(schedule)], request.request_date)
+    resolution = resolve_evidence(dataset, request.user_id)
+    return {
+        "request": {
+            "request_id": request.request_id,
+            "home_currency": profile.home_currency,
+        },
+        "decision": {
+            "request_date": request.request_date.isoformat(),
+            "desired_completion_date": request.desired_completion_date.isoformat(),
+            "requested_amount": money_text(request.requested_amount),
+            "amount_safe_to_pay": output["amount_safe_to_pay"],
+            "affordability_status": output["affordability_status"],
+            "recommended_payment_method": output["recommended_payment_method"],
+            "payment_plan": output["payment_plan"],
+            "earliest_date_for_full_payment": output["earliest_date_for_full_payment"],
+            "spending_changes_needed": output["spending_changes_needed"],
+            "payment_dates": [day.isoformat() for day, _ in schedule],
+            "payment_count": str(len(schedule)),
+            "total_payment_amount": money_text(sum((amount for _, amount in schedule), MONEY_ZERO)),
+        },
+        "forecast": {
+            "current_available_balance": money_text(profile.current_available_balance),
+            "minimum_balance_to_keep": money_text(profile.minimum_balance_to_keep),
+            "minimum_projected_balance": money_text(result.minimum_balance),
+            "minimum_projected_balance_date": result.minimum_balance_date.isoformat(),
+        },
+        "resolved_evidence": [
+            {
+                "source_id": fact.source_id,
+                "action": fact.action,
+                "effective_date": fact.effective_date.isoformat(),
+                "target_event_id": fact.target_event_id or "",
+            }
+            for fact in resolution.facts
+            if fact.action != "ignore"
+        ],
+    }
+
+
+def enrich_explanation(dataset: Dataset, request: Request, output: dict[str, str],
+                       generator: ExplanationGenerator | None = None) -> dict[str, str]:
+    """Use local generation only after deterministic output is complete and valid."""
+    if generator is None:
+        return output
+    if validate_output_row(output, dataset, request):
+        raise DatasetError(f"Cannot generate an explanation for an invalid decision: {request.request_id}")
+    try:
+        generated = generator.generate(explanation_packet(dataset, request, output))
+    except ExplanationError:
+        # A local model is an enhancement, never a source of financial-output failure.
+        return output
+    return {**output, "decision_explanation": generated}
+
+
+def predict_baseline(dataset: Dataset, request: Request,
+                     generator: ExplanationGenerator | None = None) -> dict[str, str]:
+    output = plan_spending_changes(dataset, request, predict_no_change(dataset, request)).output
+    return enrich_explanation(dataset, request, output, generator)
 
 
 def trace_request(dataset: Dataset, request: Request) -> str:
@@ -1209,8 +1282,8 @@ def trace_request(dataset: Dataset, request: Request) -> str:
     return "\n".join(lines) + "\n"
 
 
-def compare_samples(dataset: Dataset) -> tuple[list[dict[str, str]], str]:
-    predictions = [predict_baseline(dataset, request) for request in dataset.samples.values()]
+def compare_samples(dataset: Dataset, generator: ExplanationGenerator | None = None) -> tuple[list[dict[str, str]], str]:
+    predictions = [predict_baseline(dataset, request, generator) for request in dataset.samples.values()]
     fields = OUTPUT_COLUMNS[1:]
     matches = {field: 0 for field in fields}
     validation_errors: list[str] = []
@@ -1490,8 +1563,27 @@ def main() -> None:
     parser.add_argument("--write-discrepancy-report", type=Path, help="Audit an existing sample prediction CSV without running prediction.")
     parser.add_argument("--check-evidence-regressions", action="store_true", help="Run generic evidence-resolution invariants on public sample contexts.")
     parser.add_argument("--write-recurrence-audit", type=Path, help="Write cadence and explicit-event reconciliation audit for sample contexts.")
+    parser.add_argument("--llm-provider", choices=("none", "ollama"), default="none",
+                        help="Optional explanation provider. Financial decisions always remain deterministic.")
+    parser.add_argument("--ollama-model", default=os.environ.get("OLLAMA_MODEL", "qwen3:4b-instruct"),
+                        help="Local Ollama model name (default: OLLAMA_MODEL or qwen3:4b-instruct).")
+    parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
+                        help="Local Ollama base URL (default: OLLAMA_URL or http://127.0.0.1:11434).")
+    parser.add_argument("--ollama-timeout-seconds", type=int, default=90,
+                        help="Maximum time to wait for each local explanation.")
+    parser.add_argument("--explain", metavar="REQUEST_ID", help="Print the optional-model explanation for one request or sample.")
+    parser.add_argument("--write-output", type=Path, help="Write validated rows for requests.csv to this output path.")
+    parser.add_argument("--write-usage-report", type=Path,
+                        help="Write local-model token usage for this invocation (requires --llm-provider ollama).")
     args = parser.parse_args()
     dataset = load_dataset(args.dataset_dir)
+    if args.ollama_timeout_seconds <= 0:
+        raise DatasetError("--ollama-timeout-seconds must be positive")
+    generator: OllamaExplanationGenerator | None = None
+    if args.llm_provider == "ollama":
+        generator = OllamaExplanationGenerator(args.ollama_model, args.ollama_url, args.ollama_timeout_seconds)
+    if args.write_usage_report and generator is None:
+        raise DatasetError("--write-usage-report requires --llm-provider ollama")
     if args.trace:
         request = dataset.samples.get(args.trace) or dataset.requests.get(args.trace)
         if request is None:
@@ -1502,7 +1594,7 @@ def main() -> None:
             args.write_trace.parent.mkdir(parents=True, exist_ok=True)
             args.write_trace.write_text(trace, encoding="utf-8", newline="\n")
     if args.evaluate_samples:
-        predictions, report = compare_samples(dataset)
+        predictions, report = compare_samples(dataset, generator)
         write_csv(args.predictions_path, predictions)
         print(report, end="")
     if args.write_discrepancy_report:
@@ -1518,7 +1610,28 @@ def main() -> None:
         args.write_recurrence_audit.parent.mkdir(parents=True, exist_ok=True)
         args.write_recurrence_audit.write_text(build_recurrence_reconciliation_audit(dataset), encoding="utf-8", newline="\n")
         print(f"Wrote recurrence reconciliation audit: {args.write_recurrence_audit}")
-    if not args.trace and not args.evaluate_samples and not args.write_discrepancy_report and not args.check_evidence_regressions and not args.write_recurrence_audit:
+    if args.explain:
+        request = dataset.samples.get(args.explain) or dataset.requests.get(args.explain)
+        if request is None:
+            raise DatasetError(f"Unknown request_id: {args.explain}")
+        output = predict_baseline(dataset, request, generator)
+        print(output["decision_explanation"])
+    if args.write_output:
+        rows = [predict_baseline(dataset, request, generator) for request in dataset.requests.values()]
+        errors = validate_output_rows(rows, dataset, dataset.requests)
+        if errors:
+            raise DatasetError(f"Refusing to write invalid output: {errors[:5]}")
+        write_csv(args.write_output, rows)
+        print(f"Wrote {len(rows)} validated output rows: {args.write_output}")
+    if args.write_usage_report:
+        args.write_usage_report.parent.mkdir(parents=True, exist_ok=True)
+        invocation_requests = (len(dataset.requests) if args.write_output else
+                               len(dataset.samples) if args.evaluate_samples else
+                               1 if args.explain else 0)
+        args.write_usage_report.write_text(usage_report_markdown(generator.usages, invocation_requests), encoding="utf-8", newline="\n")
+        print(f"Wrote model usage report: {args.write_usage_report}")
+    if not (args.trace or args.evaluate_samples or args.write_discrepancy_report or args.check_evidence_regressions
+            or args.write_recurrence_audit or args.explain or args.write_output or args.write_usage_report):
         parser.print_help()
 
 
