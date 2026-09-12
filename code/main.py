@@ -39,7 +39,7 @@ OUTPUT_COLUMNS = (
 STATUSES = frozenset({"affordable_now", "affordable_with_plan", "affordable_later", "not_affordable"})
 METHODS = frozenset({"full_payment", "partial_payment", "installments", "wait", "not_recommended"})
 IGNORED_EVENT_STATUSES = frozenset({"cancelled", "failed", "unrealized"})
-NON_CASH_EVENT_TYPES = frozenset({"investment_value"})
+NON_CASH_EVENT_TYPES = frozenset({"investment_value", "investment_valuation"})
 
 
 class DatasetError(ValueError):
@@ -164,6 +164,8 @@ class NormalizedEvent:
     include_in_cash_flow: bool
     reason: str
     evidence_sources: tuple[str, ...] = ()
+    lifecycle_event_ids: tuple[str, ...] = ()
+    lifecycle_rule: str = ""
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,26 @@ class EvidenceResolution:
 
     def facts_for_salary(self) -> tuple[EvidenceFact, ...]:
         return tuple(fact for fact in self.facts if fact.action in {"amend_salary", "remove_salary"})
+
+
+@dataclass(frozen=True)
+class LifecycleDecision:
+    event_id: str
+    action: str
+    rule_id: str
+    related_event_ids: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class LifecycleResolution:
+    decisions: tuple[LifecycleDecision, ...]
+
+    def decision_for_event(self, event_id: str) -> LifecycleDecision | None:
+        matches = [decision for decision in self.decisions if decision.event_id == event_id]
+        if not matches:
+            return None
+        return next((decision for decision in matches if decision.action == "suppress"), matches[-1])
 
 
 @dataclass(frozen=True)
@@ -363,7 +385,17 @@ def load_dataset(dataset_dir: Path) -> Dataset:
         flexibility=row["flexibility"].lower(),
         minimum_allowed_amount=parse_decimal(row["minimum_allowed_amount"], field_name=f"{row['event_id']}.minimum_allowed_amount", allow_blank=True),
     ) for row in event_rows)
-    require_unique(events, "event_id")
+    event_index = require_unique(events, "event_id")
+    for event in events:
+        if not event.linked_event_id:
+            continue
+        parent = event_index.get(event.linked_event_id)
+        if parent is None:
+            raise DatasetError(f"Unknown linked_event_id on {event.event_id}: {event.linked_event_id}")
+        if parent.user_id != event.user_id:
+            raise DatasetError(f"Cross-user linked_event_id on {event.event_id}: {event.linked_event_id}")
+        if parent.event_id == event.event_id:
+            raise DatasetError(f"Self-linked financial event: {event.event_id}")
 
     option_rows = read_csv(dataset_dir / "request_payment_options.csv", {
         "payment_option_id", "request_id", "payment_method", "payment_amount", "number_of_payments",
@@ -474,42 +506,136 @@ def resolve_evidence(dataset: Dataset, user_id: str) -> EvidenceResolution:
     return EvidenceResolution(tuple(facts))
 
 
+def resolve_event_lifecycles(events: Iterable[FinancialEvent]) -> LifecycleResolution:
+    """Resolve only explicit linked-event relationships, never date/category proximity."""
+    ordered = sorted(events, key=lambda event: (event.event_date, event.event_id))
+    index = {event.event_id: event for event in ordered}
+    decisions: list[LifecycleDecision] = []
+
+    def record(event: FinancialEvent, action: str, rule_id: str,
+               related: FinancialEvent, reason: str) -> None:
+        decisions.append(LifecycleDecision(event.event_id, action, rule_id, (related.event_id,), reason))
+
+    for child in ordered:
+        if not child.linked_event_id:
+            continue
+        parent = index.get(child.linked_event_id)
+        if parent is None or parent.user_id != child.user_id:
+            # load_dataset rejects this for supplied files. Synthetic callers still
+            # receive an explicit conservative decision instead of silent dedupe.
+            action = "retain_conservative" if child.direction == "debit" else "suppress"
+            decisions.append(LifecycleDecision(
+                child.event_id, action, "lifecycle_unresolved_link", (child.linked_event_id,),
+                "unresolved link; retain uncertain debit liability and exclude uncertain credit",
+            ))
+            continue
+
+        if child.event_type in NON_CASH_EVENT_TYPES or child.direction == "non_cash":
+            record(parent, "retain", "lifecycle_non_cash_child", child,
+                   "linked valuation is non-cash and does not supersede the original transaction")
+            record(child, "suppress", "lifecycle_non_cash_child", parent,
+                   "linked valuation is unrealized and unavailable as cash")
+            continue
+
+        if child.event_type in {"refund", "investment_sale"} or child.direction != parent.direction:
+            record(parent, "retain", "lifecycle_distinct_cash_leg", child,
+                   "original transaction and linked refund/sale are distinct cash movements")
+            record(child, "retain", "lifecycle_distinct_cash_leg", parent,
+                   "linked refund/sale follows its own cash status and effective date")
+            continue
+
+        if parent.status in {"cancelled", "failed"} and child.status not in {"cancelled", "failed"}:
+            record(parent, "suppress", "lifecycle_replacement_after_terminal", child,
+                   "cancelled/failed predecessor is replaced by the explicitly linked active record")
+            record(child, "retain", "lifecycle_replacement_after_terminal", parent,
+                   "active linked replacement/retry remains a cash-flow candidate")
+            continue
+
+        if child.status == "settled" and parent.status in {"pending", "scheduled"}:
+            record(parent, "suppress", "lifecycle_settlement_supersedes_open", child,
+                   "settled linked record supersedes the pending/scheduled representation")
+            record(child, "retain", "lifecycle_settlement_supersedes_open", parent,
+                   "settled linked record is the authoritative cash occurrence")
+            continue
+
+        if child.status in {"cancelled", "failed"}:
+            record(parent, "retain", "lifecycle_terminal_child", child,
+                   "cancelled/failed child does not supersede its linked predecessor")
+            record(child, "suppress", "lifecycle_terminal_child", parent,
+                   "linked child is explicitly cancelled/failed")
+            continue
+
+        if (child.status == parent.status == "settled" and child.event_type == parent.event_type
+                and child.direction == parent.direction and child.amount == parent.amount
+                and child.currency == parent.currency):
+            record(parent, "suppress", "lifecycle_newer_exact_record", child,
+                   "newer exact linked settled record supersedes the older representation")
+            record(child, "retain", "lifecycle_newer_exact_record", parent,
+                   "newer exact linked settled record is authoritative")
+            continue
+
+        if child.direction == "debit":
+            record(parent, "retain_conservative", "lifecycle_ambiguous_debit", child,
+                   "ambiguous linked debit relationship; retain the possible liability")
+            record(child, "retain_conservative", "lifecycle_ambiguous_debit", parent,
+                   "ambiguous linked debit relationship; retain the possible liability")
+        else:
+            record(parent, "retain", "lifecycle_credit_own_state", child,
+                   "linked credit records remain subject to their individual settled/confirmed state")
+            record(child, "retain", "lifecycle_credit_own_state", parent,
+                   "linked credit records remain subject to their individual settled/confirmed state")
+    return LifecycleResolution(tuple(decisions))
+
+
 def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolution | None = None) -> list[NormalizedEvent]:
     """Classify events conservatively; missing/foreign unconvertible money is excluded, never zeroed."""
     profile = dataset.profiles[user_id]
     resolution = resolution or resolve_evidence(dataset, user_id)
     events = [event for event in dataset.events if event.user_id == user_id]
-    child_ids = {event.linked_event_id for event in events if event.linked_event_id}
+    lifecycle = resolve_event_lifecycles(events)
     normalized: list[NormalizedEvent] = []
     for event in events:
         cash_date = event.settlement_date or event.event_date
+        lifecycle_decision = lifecycle.decision_for_event(event.event_id)
+        lifecycle_ids = lifecycle_decision.related_event_ids if lifecycle_decision else ()
+        lifecycle_rule = lifecycle_decision.rule_id if lifecycle_decision else ""
         evidence = resolution.facts_for_event(event.event_id)
         override = next((fact for fact in reversed(evidence) if fact.action in {"cancel_event", "exclude_credit", "confirm_credit", "amend_event"}), None)
         if override is not None and override.action in {"cancel_event", "exclude_credit"}:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{override.reason}; evidence {override.source_id}", (override.source_id,)))
+            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{override.reason}; evidence {override.source_id}",
+                                              (override.source_id,), lifecycle_ids, lifecycle_rule))
+            continue
+        if lifecycle_decision is not None and lifecycle_decision.action == "suppress":
+            normalized.append(NormalizedEvent(event, None, cash_date, False, lifecycle_decision.reason,
+                                              (), lifecycle_ids, lifecycle_rule))
             continue
         if event.event_type in NON_CASH_EVENT_TYPES:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, "unavailable investment value"))
+            normalized.append(NormalizedEvent(event, None, cash_date, False, "unavailable investment value",
+                                              (), lifecycle_ids, lifecycle_rule))
             continue
         if event.status in IGNORED_EVENT_STATUSES:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{event.status} event"))
+            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{event.status} event",
+                                              (), lifecycle_ids, lifecycle_rule))
             continue
         effective_amount = override.amount if override is not None and override.action == "amend_event" and override.amount is not None else event.amount
         effective_currency = override.currency if override is not None and override.action == "amend_event" and override.currency else event.currency
         if override is not None and override.action in {"amend_event", "confirm_credit"}:
             cash_date = override.effective_date
         if effective_amount is None:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, "amount requires linked image review"))
+            normalized.append(NormalizedEvent(event, None, cash_date, False, "amount requires linked image review",
+                                              (), lifecycle_ids, lifecycle_rule))
             continue
         if event.direction not in {"credit", "debit"}:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, "unknown cash direction"))
+            normalized.append(NormalizedEvent(event, None, cash_date, False, "unknown cash direction",
+                                              (), lifecycle_ids, lifecycle_rule))
             continue
         if effective_currency == profile.home_currency:
             amount_home = effective_amount
         else:
             rate = dataset.exchange_rates.get((cash_date, effective_currency, profile.home_currency))
             if rate is None:
-                normalized.append(NormalizedEvent(event, None, cash_date, False, "missing dated exchange rate"))
+                normalized.append(NormalizedEvent(event, None, cash_date, False, "missing dated exchange rate",
+                                                  (), lifecycle_ids, lifecycle_rule))
                 continue
             amount_home = effective_amount * rate
         confirmed_credit = credit_is_confirmed(event, override)
@@ -517,15 +643,18 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
             reason = ("pending credit is not available"
                       if event.status == "pending" else "unconfirmed scheduled credit is unavailable")
             normalized.append(NormalizedEvent(event, amount_home, cash_date, False, reason,
-                                              (override.source_id,) if override is not None else ()))
-        elif event.event_id in child_ids and event.status != "scheduled":
-            normalized.append(NormalizedEvent(event, amount_home, cash_date, False, "superseded transaction lifecycle record"))
+                                              (override.source_id,) if override is not None else (),
+                                              lifecycle_ids, lifecycle_rule))
         else:
             if event.status == "pending" and event.direction == "debit":
                 reason = "pending debit retained as a conservative liability"
             else:
                 reason = f"cash event; evidence {override.source_id}" if override is not None else "cash event"
-            normalized.append(NormalizedEvent(event, amount_home, cash_date, True, reason, (override.source_id,) if override is not None else ()))
+            if lifecycle_decision is not None:
+                reason = f"{reason}; {lifecycle_decision.reason}"
+            normalized.append(NormalizedEvent(event, amount_home, cash_date, True, reason,
+                                              (override.source_id,) if override is not None else (),
+                                              lifecycle_ids, lifecycle_rule))
     return normalized
 
 
@@ -538,7 +667,8 @@ def future_explicit_flows(normalized: Iterable[NormalizedEvent], as_of: date) ->
         signed_amount = item.amount_home if event.direction == "credit" else -item.amount_home
         flows.append(ForecastFlow(
             item.cash_date, signed_amount, event.event_id, event.category, event.description, "explicit",
-            source_event_ids=(event.event_id,), evidence_sources=item.evidence_sources,
+            source_event_ids=tuple(dict.fromkeys((event.event_id, *item.lifecycle_event_ids))),
+            evidence_sources=item.evidence_sources,
             trace_reason=item.reason,
         ))
     return flows
@@ -1302,6 +1432,7 @@ def trace_request(dataset: Dataset, request: Request) -> str:
     """Produce an auditable Markdown trace without relying on solved sample labels."""
     normalized, flows, rules = base_flows(dataset, request)
     resolution = resolve_evidence(dataset, request.user_id)
+    lifecycle = resolve_event_lifecycles(event for event in dataset.events if event.user_id == request.user_id)
     explicit = future_explicit_flows(normalized, request.request_date)
     lines = [
         f"# Trace: {request.request_id}", "",
@@ -1330,6 +1461,13 @@ def trace_request(dataset: Dataset, request: Request) -> str:
         lines.extend(["", "## Evidence resolutions", ""])
         lines.extend(f"- `{fact.source_id}`: `{fact.action}` effective {fact.effective_date}; {fact.reason}." for fact in applied_facts)
         lines.extend(f"- `{item.source.event_id}`: {'included' if item.include_in_cash_flow else 'excluded'} by `{', '.join(item.evidence_sources)}` under {item.reason}." for item in evidence_overrides)
+    if lifecycle.decisions:
+        lines.extend(["", "## Linked-event lifecycle resolution", ""])
+        lines.extend(
+            f"- `{decision.event_id}` -> `{', '.join(decision.related_event_ids)}`: "
+            f"`{decision.action}` under `{decision.rule_id}`; {decision.reason}."
+            for decision in lifecycle.decisions
+        )
     terminal_records = [item for item in normalized if is_terminal_salary_record(item) and item.cash_date <= request.request_date]
     if terminal_records:
         lines.extend(["", "## Explicit terminal income records", ""])
