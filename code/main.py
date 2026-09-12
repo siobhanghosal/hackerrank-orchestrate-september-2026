@@ -371,6 +371,19 @@ def text_date(text: str, fallback: date) -> date:
     return date.fromisoformat(match.group(1)) if match else fallback
 
 
+def credit_is_confirmed(event: FinancialEvent, override: EvidenceFact | None) -> bool:
+    """Return true only for settled or explicitly attributable future credits."""
+    if event.direction != "credit":
+        return False
+    if event.status == "settled" or (override is not None and override.action == "confirm_credit"):
+        return True
+    # The supplied scheduled-salary records identify themselves as confirmed and
+    # include a settlement date.  Do not treat an arbitrary scheduled income row
+    # as confirmed merely because it is categorised as salary.
+    return (event.status == "scheduled" and event.event_type == "income" and event.category == "salary"
+            and "confirmed" in event.description.casefold() and event.settlement_date is not None)
+
+
 def resolve_evidence(dataset: Dataset, user_id: str) -> EvidenceResolution:
     """Extract only explicit, high-confidence textual evidence; never infer from a vague notice."""
     events = {event.event_id: event for event in dataset.events if event.user_id == user_id}
@@ -430,11 +443,11 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
         if override is not None and override.action in {"cancel_event", "exclude_credit"}:
             normalized.append(NormalizedEvent(event, None, cash_date, False, f"{override.reason}; evidence {override.source_id}", (override.source_id,)))
             continue
-        if event.status in IGNORED_EVENT_STATUSES:
-            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{event.status} event"))
-            continue
         if event.event_type in NON_CASH_EVENT_TYPES:
             normalized.append(NormalizedEvent(event, None, cash_date, False, "unavailable investment value"))
+            continue
+        if event.status in IGNORED_EVENT_STATUSES:
+            normalized.append(NormalizedEvent(event, None, cash_date, False, f"{event.status} event"))
             continue
         effective_amount = override.amount if override is not None and override.action == "amend_event" and override.amount is not None else event.amount
         effective_currency = override.currency if override is not None and override.action == "amend_event" and override.currency else event.currency
@@ -454,14 +467,19 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
                 normalized.append(NormalizedEvent(event, None, cash_date, False, "missing dated exchange rate"))
                 continue
             amount_home = effective_amount * rate
-        if event.status == "pending" and event.direction == "credit" and not (override is not None and override.action == "confirm_credit"):
-            normalized.append(NormalizedEvent(event, amount_home, cash_date, False, "pending credit is not available"))
-        elif event.status == "scheduled" and event.direction == "credit" and not (event.event_type == "income" and event.category == "salary"):
-            normalized.append(NormalizedEvent(event, amount_home, cash_date, False, "scheduled non-salary credit is unavailable until settled"))
+        confirmed_credit = credit_is_confirmed(event, override)
+        if event.direction == "credit" and not confirmed_credit:
+            reason = ("pending credit is not available"
+                      if event.status == "pending" else "unconfirmed scheduled credit is unavailable")
+            normalized.append(NormalizedEvent(event, amount_home, cash_date, False, reason,
+                                              (override.source_id,) if override is not None else ()))
         elif event.event_id in child_ids and event.status != "scheduled":
             normalized.append(NormalizedEvent(event, amount_home, cash_date, False, "superseded transaction lifecycle record"))
         else:
-            reason = f"cash event; evidence {override.source_id}" if override is not None else "cash event"
+            if event.status == "pending" and event.direction == "debit":
+                reason = "pending debit retained as a conservative liability"
+            else:
+                reason = f"cash event; evidence {override.source_id}" if override is not None else "cash event"
             normalized.append(NormalizedEvent(event, amount_home, cash_date, True, reason, (override.source_id,) if override is not None else ()))
     return normalized
 

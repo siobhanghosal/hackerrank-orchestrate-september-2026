@@ -51,6 +51,25 @@ git diff --check
 
 No core field regressed. The rule requires both a final/last term and a payroll/salary/pay term on a settled salary credit, so it does not infer employment termination from ordinary income variability.
 
+## Completed lifecycle-conformance boundary
+
+The milestone now also makes the full conservative cash-state boundary explicit:
+
+- An unconfirmed pending credit is excluded.
+- A pending credit is included only with an attributable `confirm_credit` fact,
+  using that fact's effective cash date.
+- A scheduled salary is included only when the supplied event explicitly says it
+  is confirmed and includes its settlement date; other scheduled credits are
+  excluded.
+- Pending debits remain in the ledger as conservative liabilities.
+- `investment_value` records are excluded before cash-flow construction,
+  including when their status is `unrealized`.
+
+`test_credit_lifecycle.py` covers each case. The full suite has 24 tests, the
+sample metrics remain `4/25`, `19/25`, `21/25`, `16/25`, `12/25`, and `22/25`
+for amount, status, method, plan, earliest date, and spending changes
+respectively, and output validation remains at zero errors.
+
 ## Recommendation: accept
 
 The rule is attributable, traceable, independently tested, and improves four core exact-match totals without regression. The next diagnosis should address missing essential variable spending rather than expand terminal-income matching.
