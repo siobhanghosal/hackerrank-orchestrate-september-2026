@@ -501,7 +501,17 @@ def recurring_rules(normalized: Iterable[NormalizedEvent], as_of: date, resoluti
     rules: list[RecurringRule] = []
     for (description, category, direction), members in groups.items():
         members.sort(key=lambda item: item.cash_date or date.min)
-        dates = [item.cash_date for item in members if item.cash_date]
+        salary_facts: list[EvidenceFact] = []
+        # Settlement dates normally determine cash timing.  A confirmed employer
+        # replacement date is stronger evidence when a delayed prior settlement
+        # would otherwise make a regular payroll cadence look irregular.  In that
+        # narrow case, use the supplied intended payroll dates to establish the
+        # fixed-day interval, then anchor future cash flow on the confirmation.
+        if category == "salary" and direction == "credit" and resolution is not None:
+            salary_facts = [fact for fact in resolution.facts_for_salary()
+                            if fact.action == "amend_salary" and fact.effective_date > as_of]
+        dates = ([item.source.event_date for item in members]
+                 if salary_facts else [item.cash_date for item in members if item.cash_date])
         if len(dates) < 3:
             continue
         intervals = [(later - earlier).days for earlier, later in zip(dates, dates[1:]) if (later - earlier).days > 0]

@@ -5,7 +5,7 @@ request_03,2190071.39,affordable_later,wait,2019-10-15:5491000,2019-10-15,none,B
 request_04,12693000,affordable_now,full_payment,2024-06-04:12693000,2024-06-04,none,Baseline forecast keeps the balance above the minimum after full payment.
 request_05,7006.21,not_affordable,not_recommended,none,,none,Baseline found no eligible safe plan within 90 days.
 request_06,620.4,affordable_now,full_payment,2026-01-03:620.4,2026-01-03,none,Baseline forecast keeps the balance above the minimum after full payment.
-request_07,0,not_affordable,not_recommended,none,,none,Baseline found no eligible safe plan within 90 days.
+request_07,98080.53,affordable_with_plan,installments,2024-09-12:68432|2024-10-10:68432|2024-11-07:68432,2024-10-24,none,Baseline selected supplied installment option payment_option_19.
 request_08,521.57,affordable_later,wait,2025-02-15:996.6,2025-02-15,none,Baseline forecast finds a later safe full-payment date.
 request_09,166.61,affordable_now,full_payment,2026-07-04:166.61,2026-07-04,none,Baseline forecast keeps the balance above the minimum after full payment.
 request_10,266700,not_affordable,not_recommended,none,,none,Baseline found no eligible safe plan within 90 days.
