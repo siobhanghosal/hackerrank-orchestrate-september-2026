@@ -5,8 +5,10 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal as D
 from pathlib import Path
+import sys
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main as m
 
 
@@ -110,7 +112,7 @@ class SpendingTests(unittest.TestCase):
             self.assertTrue(any("breaches" in error for error in m.validate_output_row(row, dataset, request)))
 
     def test_all_public_safe_decisions_unchanged_and_core_contexts_eligible(self):
-        dataset = m.load_dataset(Path(__file__).resolve().parents[1] / "dataset")
+        dataset = m.load_dataset(Path(__file__).resolve().parents[2] / "dataset")
         for request in dataset.samples.values():
             before = m.predict_no_change(dataset, request)
             after = m.predict_baseline(dataset, request)

@@ -19,7 +19,7 @@ The rejected recurrence-reconciliation candidate remains inactive. The active fo
 ```text
 python code/main.py --evaluate-samples
 python code/main.py --check-evidence-regressions
-python -m unittest discover -s code -p "test*.py" -v
+python -m unittest discover -s code/tests -p "test*.py" -v
 python -c "... predict all 250 requests in memory and call validate_output_rows(...) ..."
 git diff --check
 ```

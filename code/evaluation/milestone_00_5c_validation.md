@@ -28,7 +28,7 @@ SHA256 40F271DD1CF3588A37A9FA6FF59E28387E971D273D34C86B1175EA0DEB55B4C4
 ## Validation
 
 ```text
-python -m unittest discover -s code -p "test*.py" -v
+python -m unittest discover -s code/tests -p "test*.py" -v
 python code/main.py --evaluate-samples
 git diff --check
 ```

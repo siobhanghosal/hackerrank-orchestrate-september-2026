@@ -21,7 +21,7 @@ streams continue to use settlement dates.
 ## Validation
 
 ```text
-python -m unittest discover -s code -p "test*.py" -v
+python -m unittest discover -s code/tests -p "test*.py" -v
 python code/main.py --evaluate-samples
 git diff --check
 ```

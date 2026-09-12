@@ -4,14 +4,16 @@ import unittest
 from dataclasses import fields
 from datetime import timedelta
 from pathlib import Path
+import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main as m
 
 
 class ValidationBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.dataset = m.load_dataset(Path(__file__).resolve().parent.parent / "dataset")
+        cls.dataset = m.load_dataset(Path(__file__).resolve().parents[2] / "dataset")
 
     def predicted_row(self, request_id):
         request = self.dataset.samples[request_id]

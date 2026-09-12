@@ -12,14 +12,14 @@ No pending-credit, linked-event, investment, FX, payment-option, or spending-cha
   - Adds `is_terminal_salary_record` for settled salary credits whose source description explicitly states `final` or `last` payroll/salary/pay.
   - Suppresses only an earlier same-category inferred salary stream after such a record.
   - Adds the suppressing source event and rule to `--trace`.
-- `code/test_terminal_salary.py`
+- `code/tests/test_terminal_salary.py`
   - Confirms a later final payroll terminates recurrence.
   - Confirms a non-terminal later payroll does not terminate recurrence.
 
 ## Commands run
 
 ```text
-python -m unittest discover -s code -p "test*.py" -v
+python -m unittest discover -s code/tests -p "test*.py" -v
 python code/main.py --evaluate-samples
 python code/main.py --trace request_05
 git diff --check

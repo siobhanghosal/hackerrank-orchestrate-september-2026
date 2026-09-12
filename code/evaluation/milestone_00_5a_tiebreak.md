@@ -21,13 +21,13 @@ This milestone does not change cash-flow construction, evidence resolution, life
   - Applies the literal selector tuple in one location, `candidate_rank`.
   - Makes `wait` eligible only if full payment becomes safe strictly after `request_date`.
   - Adds the safe candidates, rank tuple, and selected candidate to `--trace`.
-- `code/test_selector_tiebreak.py`
+- `code/tests/test_selector_tiebreak.py`
   - Covers deadline, cost, start date, payment count, and option-ID precedence with synthetic candidates.
 
 ## Commands run
 
 ```text
-python -m unittest discover -s code -p "test*.py" -v
+python -m unittest discover -s code/tests -p "test*.py" -v
 python code/main.py --evaluate-samples
 python code/main.py --trace request_01
 git diff --check
