@@ -1075,6 +1075,21 @@ def earliest_safe_full_payment(dataset: Dataset, request: Request, base: Sequenc
     return None
 
 
+def earliest_safe_partial_remainder(request: Request, profile: Profile, base: Sequence[ForecastFlow],
+                                    first_payment: Decimal) -> date | None:
+    """Find a safe second payment date after an already-safe request-date payment."""
+    if not MONEY_ZERO < first_payment < request.requested_amount:
+        return None
+    remainder = request.requested_amount - first_payment
+    end = min(request.desired_completion_date, request.request_date + timedelta(days=FORECAST_DAYS))
+    for offset in range(1, (end - request.request_date).days + 1):
+        day = request.request_date + timedelta(days=offset)
+        schedule = ((request.request_date, first_payment), (day, remainder))
+        if is_safe(simulate_cash_flow(profile, [*base, *plan_flows(schedule)], request.request_date), profile):
+            return day
+    return None
+
+
 @dataclass(frozen=True)
 class PaymentCandidate:
     """One safe, permitted no-change plan, ranked only by the published selector order."""
@@ -1174,12 +1189,12 @@ def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Seque
                                                f"Baseline selected supplied installment option "
                                                f"{evaluation.option.payment_option_id}."))
 
+    partial_second_date = earliest_safe_partial_remainder(request, profile, baseline_flows, safe_amount)
     if (request.allows_partial_payment and "partial_payment" in profile.payment_methods
-            and MONEY_ZERO < safe_amount < request.requested_amount and earliest is not None
-            and earliest <= request.desired_completion_date):
-        schedule = ((request.request_date, safe_amount), (earliest, request.requested_amount - safe_amount))
+            and partial_second_date is not None):
+        schedule = ((request.request_date, safe_amount), (partial_second_date, request.requested_amount - safe_amount))
         if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
-            candidates.append(PaymentCandidate("affordable_with_plan", "partial_payment", schedule, earliest, None,
+            candidates.append(PaymentCandidate("affordable_with_plan", "partial_payment", schedule, partial_second_date, None,
                                                "Baseline splits the request across two safe payments."))
 
     if (earliest is not None and request.request_date < earliest <= request.desired_completion_date
@@ -1626,6 +1641,7 @@ def trace_request(dataset: Dataset, request: Request) -> str:
     base_result = simulate_cash_flow(profile, flows, request.request_date)
     safe_amount = min(request.requested_amount, max(MONEY_ZERO, base_result.minimum_balance - profile.minimum_balance_to_keep))
     earliest = earliest_safe_full_payment(dataset, request, flows)
+    partial_second_date = earliest_safe_partial_remainder(request, profile, flows, safe_amount)
     candidates = payment_candidates(dataset, request, flows, safe_amount, earliest)
     selected = choose_payment_candidate(candidates, request)
     option_evaluations = evaluate_installment_options(dataset, request, flows)
@@ -1638,6 +1654,14 @@ def trace_request(dataset: Dataset, request: Request) -> str:
         )
     else:
         lines.append("- No supplied installment options.")
+    lines.extend(["", "## Wait and partial-payment search", ""])
+    lines.append(f"- Earliest safe one-payment date: {earliest or 'none within the 90-day horizon'}.")
+    if partial_second_date is not None:
+        lines.append(f"- Safe second payment after request-date amount {money_text(safe_amount)}: {partial_second_date}.")
+    elif MONEY_ZERO < safe_amount < request.requested_amount:
+        lines.append(f"- No safe second payment by the deadline after request-date amount {money_text(safe_amount)}.")
+    else:
+        lines.append("- No partial candidate: the request-date capacity is zero or already covers the full request.")
     lines.extend(["", "## Safe no-change payment candidates", ""])
     if candidates:
         for candidate in sorted(candidates, key=lambda candidate: candidate_rank(candidate, request)):
