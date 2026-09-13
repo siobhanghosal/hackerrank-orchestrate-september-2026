@@ -156,6 +156,17 @@ class ExchangeRate:
 
 
 @dataclass(frozen=True)
+class FxRateResolution:
+    rate_date: date
+    from_currency: str
+    to_currency: str
+    rate: Decimal | None
+    rule_id: str
+    source_pair: tuple[str, str] | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class NormalizedEvent:
     """An event classified for the cash forecast, with money in home currency."""
     source: FinancialEvent
@@ -166,6 +177,10 @@ class NormalizedEvent:
     evidence_sources: tuple[str, ...] = ()
     lifecycle_event_ids: tuple[str, ...] = ()
     lifecycle_rule: str = ""
+    original_amount: Decimal | None = None
+    original_currency: str | None = None
+    conversion_rate: Decimal | None = None
+    fx_rule: str = ""
 
 
 @dataclass(frozen=True)
@@ -226,6 +241,10 @@ class ForecastFlow:
     source_event_ids: tuple[str, ...] = ()
     evidence_sources: tuple[str, ...] = ()
     trace_reason: str = ""
+    original_amount: Decimal | None = None
+    original_currency: str | None = None
+    conversion_rate: Decimal | None = None
+    fx_rule: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.amount, Decimal) or not self.amount.is_finite():
@@ -421,7 +440,10 @@ def load_dataset(dataset_dir: Path) -> Dataset:
         key = (parse_date(row["rate_date"], field_name="rate_date") or date.min, row["from_currency"], row["to_currency"])
         if key in exchange_rates:
             raise DatasetError(f"Duplicate exchange-rate row: {key}")
-        exchange_rates[key] = parse_decimal(row["rate"], field_name="rate") or MONEY_ZERO
+        rate = parse_decimal(row["rate"], field_name="rate") or MONEY_ZERO
+        if not rate.is_finite() or rate <= MONEY_ZERO:
+            raise DatasetError(f"Exchange rate must be a positive finite Decimal: {key}")
+        exchange_rates[key] = rate
 
     messages = tuple(read_csv(dataset_dir / "messages.csv", {"message_id", "user_id", "request_id", "related_event_id", "sent_at", "source_type", "message_text"}))
     images = tuple(read_csv(dataset_dir / "images.csv", {"image_id", "user_id", "request_id", "related_event_id"}))
@@ -587,6 +609,25 @@ def resolve_event_lifecycles(events: Iterable[FinancialEvent]) -> LifecycleResol
     return LifecycleResolution(tuple(decisions))
 
 
+def resolve_dated_fx_rate(exchange_rates: Mapping[tuple[date, str, str], Decimal], rate_date: date,
+                          from_currency: str, to_currency: str) -> FxRateResolution:
+    """Resolve one exact-date direct or mathematically valid inverse exchange rate."""
+    if from_currency == to_currency:
+        return FxRateResolution(rate_date, from_currency, to_currency, Decimal("1"), "fx_identity", None,
+                                "source and target currencies are identical")
+    direct = exchange_rates.get((rate_date, from_currency, to_currency))
+    inverse = exchange_rates.get((rate_date, to_currency, from_currency))
+    if direct is not None:
+        return FxRateResolution(rate_date, from_currency, to_currency, direct, "fx_direct_pair",
+                                (from_currency, to_currency),
+                                "exact-date direct rate (preferred over any rounded inverse pair)")
+    if inverse is not None:
+        return FxRateResolution(rate_date, from_currency, to_currency, Decimal("1") / inverse, "fx_inverse_pair",
+                                (to_currency, from_currency), "exact-date inverse rate")
+    return FxRateResolution(rate_date, from_currency, to_currency, None, "fx_missing_pair", None,
+                            "no direct or inverse rate exists on the cash date")
+
+
 def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolution | None = None) -> list[NormalizedEvent]:
     """Classify events conservatively; missing/foreign unconvertible money is excluded, never zeroed."""
     profile = dataset.profiles[user_id]
@@ -629,22 +670,22 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
             normalized.append(NormalizedEvent(event, None, cash_date, False, "unknown cash direction",
                                               (), lifecycle_ids, lifecycle_rule))
             continue
-        if effective_currency == profile.home_currency:
-            amount_home = effective_amount
-        else:
-            rate = dataset.exchange_rates.get((cash_date, effective_currency, profile.home_currency))
-            if rate is None:
-                normalized.append(NormalizedEvent(event, None, cash_date, False, "missing dated exchange rate",
-                                                  (), lifecycle_ids, lifecycle_rule))
-                continue
-            amount_home = effective_amount * rate
+        fx = resolve_dated_fx_rate(dataset.exchange_rates, cash_date, effective_currency, profile.home_currency)
+        if fx.rate is None:
+            normalized.append(NormalizedEvent(
+                event, None, cash_date, False, fx.reason, (), lifecycle_ids, lifecycle_rule,
+                effective_amount, effective_currency, None, fx.rule_id,
+            ))
+            continue
+        amount_home = effective_amount * fx.rate
         confirmed_credit = credit_is_confirmed(event, override)
         if event.direction == "credit" and not confirmed_credit:
             reason = ("pending credit is not available"
                       if event.status == "pending" else "unconfirmed scheduled credit is unavailable")
             normalized.append(NormalizedEvent(event, amount_home, cash_date, False, reason,
                                               (override.source_id,) if override is not None else (),
-                                              lifecycle_ids, lifecycle_rule))
+                                              lifecycle_ids, lifecycle_rule, effective_amount,
+                                              effective_currency, fx.rate, fx.rule_id))
         else:
             if event.status == "pending" and event.direction == "debit":
                 reason = "pending debit retained as a conservative liability"
@@ -654,7 +695,8 @@ def normalize_events(dataset: Dataset, user_id: str, resolution: EvidenceResolut
                 reason = f"{reason}; {lifecycle_decision.reason}"
             normalized.append(NormalizedEvent(event, amount_home, cash_date, True, reason,
                                               (override.source_id,) if override is not None else (),
-                                              lifecycle_ids, lifecycle_rule))
+                                              lifecycle_ids, lifecycle_rule, effective_amount,
+                                              effective_currency, fx.rate, fx.rule_id))
     return normalized
 
 
@@ -670,6 +712,10 @@ def future_explicit_flows(normalized: Iterable[NormalizedEvent], as_of: date) ->
             source_event_ids=tuple(dict.fromkeys((event.event_id, *item.lifecycle_event_ids))),
             evidence_sources=item.evidence_sources,
             trace_reason=item.reason,
+            original_amount=item.original_amount,
+            original_currency=item.original_currency,
+            conversion_rate=item.conversion_rate,
+            fx_rule=item.fx_rule,
         ))
     return flows
 
@@ -1417,15 +1463,31 @@ def predict_baseline(dataset: Dataset, request: Request,
 
 
 def ledger_markdown_rows(result: SimulationResult) -> list[str]:
-    return [
-        f"| {step.sequence} | {step.flow.flow_date} | {step.flow.direction} | "
-        f"{money_text(step.flow.amount)} | {money_text(step.opening_balance)} | "
-        f"{money_text(step.closing_balance)} | `{step.flow.source_id}` | {step.flow.kind} | "
-        f"{', '.join(f'`{source}`' for source in step.flow.source_event_ids) or '-'} | "
-        f"{', '.join(f'`{source}`' for source in step.flow.evidence_sources) or '-'} | "
-        f"{markdown_cell(step.flow.trace_reason)} |"
-        for step in result.ledger_steps
-    ]
+    rows: list[str] = []
+    for step in result.ledger_steps:
+        flow = step.flow
+        has_conversion = flow.fx_rule in {"fx_direct_pair", "fx_inverse_pair"}
+        original = (f"{money_text(flow.original_amount)} {flow.original_currency}"
+                    if has_conversion and flow.original_amount is not None else "-")
+        fx = (f"{money_text(flow.conversion_rate)} ({flow.fx_rule})"
+              if has_conversion and flow.conversion_rate is not None else "-")
+        rows.append(
+            f"| {step.sequence} | {flow.flow_date} | {flow.direction} | {money_text(flow.amount)} | "
+            f"{money_text(step.opening_balance)} | {money_text(step.closing_balance)} | `{flow.source_id}` | "
+            f"{flow.kind} | {', '.join(f'`{source}`' for source in flow.source_event_ids) or '-'} | "
+            f"{', '.join(f'`{source}`' for source in flow.evidence_sources) or '-'} | "
+            f"{markdown_cell(flow.trace_reason)} | {original} | {fx} |"
+        )
+    return rows
+
+
+def flow_fx_summary(flow: ForecastFlow, home_currency: str) -> str:
+    if (flow.fx_rule not in {"fx_direct_pair", "fx_inverse_pair"}
+            or flow.original_amount is None or flow.original_currency is None or flow.conversion_rate is None):
+        return ""
+    return (f"{money_text(flow.original_amount)} {flow.original_currency} x "
+            f"{money_text(flow.conversion_rate)} = {money_text(abs(flow.amount))} {home_currency} "
+            f"({flow.fx_rule})")
 
 
 def trace_request(dataset: Dataset, request: Request) -> str:
@@ -1443,6 +1505,12 @@ def trace_request(dataset: Dataset, request: Request) -> str:
         lines.extend(f"- `{flow.source_id}` — {flow.flow_date}: {money_text(flow.amount)} ({flow.description}; {flow.kind})." for flow in explicit)
     else:
         lines.append("- None.")
+    fx_explicit = [flow for flow in explicit if flow_fx_summary(flow, dataset.profiles[request.user_id].home_currency)]
+    if fx_explicit:
+        lines.extend(["", "## Dated FX conversions", ""])
+        lines.extend(f"- `{flow.source_id}` on {flow.flow_date}: "
+                     f"{flow_fx_summary(flow, dataset.profiles[request.user_id].home_currency)}."
+                     for flow in fx_explicit)
     lines.extend(["", "## Inferred recurring commitments counted", ""])
     if rules:
         for rule in rules:
@@ -1504,9 +1572,9 @@ def trace_request(dataset: Dataset, request: Request) -> str:
          if baseline_breach else "- First minimum-balance breach: none."),
         "", "## Ordered ledger for the recommended output", "",
         "Same-day rule: debits first, then credits; ties use source ID, kind, category, and exact Decimal amount.", "",
-        "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason |",
-        "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
-        *(ledger_markdown_rows(recommended_result) or ["| - | - | - | - | - | - | - | - | - | - | No forecast flows |"]),
+        "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason | Original | FX rate rule |",
+        "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |",
+        *(ledger_markdown_rows(recommended_result) or ["| - | - | - | - | - | - | - | - | - | - | - | - | No forecast flows |"]),
         "",
         (f"First recommended-plan breach: {selected_breach.flow.flow_date} after `{selected_breach.flow.source_id}`."
          if selected_breach else "First recommended-plan breach: none."),
@@ -1727,9 +1795,9 @@ def build_ledger_delta_report(dataset: Dataset) -> str:
              f"closing at `{money_text(immediate_breach.closing_balance)}`"
              if immediate_breach else "- Immediate-full first breach: none"), "",
             "### Included 90-day forecast ledger", "",
-            "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason |",
-            "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
-            *(ledger_markdown_rows(baseline) or ["| - | - | - | - | - | - | - | - | - | - | No forecast flows |"]), "",
+            "| # | Date | Direction | Change | Opening | Closing | Source | Kind | Source events | Evidence | Inclusion reason | Original | FX rate rule |",
+            "| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |",
+            *(ledger_markdown_rows(baseline) or ["| - | - | - | - | - | - | - | - | - | - | - | - | No forecast flows |"]), "",
             "### Excluded source events", "",
             "| Event | Cash date | Direction | Home amount | Reason |",
             "| --- | --- | --- | ---: | --- |",
