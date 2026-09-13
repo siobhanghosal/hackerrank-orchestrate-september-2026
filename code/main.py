@@ -148,6 +148,15 @@ class PaymentOption:
 
 
 @dataclass(frozen=True)
+class PaymentOptionEvaluation:
+    """Eligibility and safety result for one supplied payment option."""
+    option: PaymentOption
+    schedule: tuple[tuple[date, Decimal], ...]
+    accepted: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class ExchangeRate:
     rate_date: date
     from_currency: str
@@ -430,6 +439,14 @@ def load_dataset(dataset_dir: Path) -> Dataset:
         total_payable_amount=parse_decimal(row["total_payable_amount"], field_name="total_payable_amount") or MONEY_ZERO,
     ) for row in option_rows)
     require_unique(options, "payment_option_id")
+    option_requests = {**requests, **samples}
+    for option in options:
+        option_request = option_requests.get(option.request_id)
+        if option_request is None:
+            raise DatasetError(f"Unknown request_id on payment option {option.payment_option_id}: {option.request_id}")
+        option_errors = payment_option_validation_errors(option, option_request)
+        if option_errors:
+            raise DatasetError(f"Invalid payment option {option.payment_option_id}: {'; '.join(option_errors)}")
     options_by_request: dict[str, list[PaymentOption]] = defaultdict(list)
     for option in options:
         options_by_request[option.request_id].append(option)
@@ -871,10 +888,41 @@ def is_safe(result: SimulationResult, profile: Profile) -> bool:
 def payment_schedule(option: PaymentOption) -> list[tuple[date, Decimal]]:
     if option.number_of_payments < 1:
         return []
-    if option.number_of_payments > 1 and not option.payment_frequency_days:
+    if option.number_of_payments > 1 and (option.payment_frequency_days is None or option.payment_frequency_days <= 0):
         return []
     return [(option.first_payment_date + timedelta(days=(option.payment_frequency_days or 0) * index), option.payment_amount)
             for index in range(option.number_of_payments)]
+
+
+def payment_option_validation_errors(option: PaymentOption, request: Request) -> list[str]:
+    """Validate a supplied option from its schema fields, before it can be selected."""
+    errors: list[str] = []
+    if option.payment_method not in {"full_payment", "installments"}:
+        errors.append("unsupported payment_method")
+    if not option.payment_amount.is_finite() or option.payment_amount <= MONEY_ZERO:
+        errors.append("payment_amount must be a positive finite Decimal")
+    if option.number_of_payments < 1:
+        errors.append("number_of_payments must be at least one")
+    if option.number_of_payments == 1 and option.payment_frequency_days is not None:
+        errors.append("one-payment option must not declare payment_frequency_days")
+    if option.number_of_payments > 1 and (option.payment_frequency_days is None or option.payment_frequency_days <= 0):
+        errors.append("multi-payment option requires positive payment_frequency_days")
+    if not option.financing_fee.is_finite() or option.financing_fee < MONEY_ZERO:
+        errors.append("financing_fee must be a non-negative finite Decimal")
+    if not option.total_payable_amount.is_finite() or option.total_payable_amount <= MONEY_ZERO:
+        errors.append("total_payable_amount must be a positive finite Decimal")
+    schedule = payment_schedule(option)
+    scheduled_total = sum((amount for _, amount in schedule), MONEY_ZERO)
+    if not schedule:
+        errors.append("payment schedule cannot be constructed")
+    elif scheduled_total != option.total_payable_amount:
+        errors.append("scheduled payments do not equal total_payable_amount")
+    if option.total_payable_amount != request.requested_amount + option.financing_fee:
+        errors.append("total_payable_amount does not equal requested_amount plus financing_fee")
+    if option.payment_method == "full_payment":
+        if option.number_of_payments != 1 or option.first_payment_date != request.request_date:
+            errors.append("full_payment option must be one payment on request_date")
+    return errors
 
 
 def plan_flows(schedule: Iterable[tuple[date, Decimal]]) -> list[ForecastFlow]:
@@ -1066,6 +1114,44 @@ def choose_payment_candidate(candidates: Sequence[PaymentCandidate], request: Re
     return min(candidates, key=lambda candidate: candidate_rank(candidate, request), default=None)
 
 
+def evaluate_installment_options(dataset: Dataset, request: Request,
+                                 baseline_flows: Sequence[ForecastFlow]) -> list[PaymentOptionEvaluation]:
+    """Evaluate every supplied installment offer as its complete dated schedule."""
+    profile = dataset.profiles[request.user_id]
+    evaluations: list[PaymentOptionEvaluation] = []
+    for option in sorted(dataset.payment_options.get(request.request_id, ()), key=lambda item: item.payment_option_id):
+        schedule = tuple(payment_schedule(option))
+        if option.payment_method != "installments":
+            evaluations.append(PaymentOptionEvaluation(option, schedule, False, "not an installment option"))
+            continue
+        errors = payment_option_validation_errors(option, request)
+        if errors:
+            evaluations.append(PaymentOptionEvaluation(option, schedule, False, "; ".join(errors)))
+            continue
+        if "installments" not in profile.payment_methods:
+            evaluations.append(PaymentOptionEvaluation(option, schedule, False, "installments are not accepted by the user"))
+            continue
+        if profile.max_installment_months is not None and option.number_of_payments > profile.max_installment_months:
+            evaluations.append(PaymentOptionEvaluation(option, schedule, False,
+                                                       "option exceeds max_installment_months"))
+            continue
+        if schedule[-1][0] > request.desired_completion_date:
+            evaluations.append(PaymentOptionEvaluation(option, schedule, False,
+                                                       "option completes after desired_completion_date"))
+            continue
+        result = simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date)
+        breach = result.first_breach(profile.minimum_balance_to_keep)
+        if breach is not None:
+            evaluations.append(PaymentOptionEvaluation(
+                option, schedule, False,
+                f"minimum balance breaches on {breach.flow.flow_date} after {breach.flow.source_id}",
+            ))
+            continue
+        evaluations.append(PaymentOptionEvaluation(option, schedule, True,
+                                                   "all dated payments are safe through completion"))
+    return evaluations
+
+
 def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Sequence[ForecastFlow],
                        safe_amount: Decimal, earliest: date | None) -> list[PaymentCandidate]:
     """Construct all eligible safe no-change plans before applying the selector."""
@@ -1081,17 +1167,12 @@ def payment_candidates(dataset: Dataset, request: Request, baseline_flows: Seque
                                            option_ids[0] if option_ids else None,
                                            "Baseline forecast keeps the balance above the minimum after full payment."))
 
-    if "installments" in profile.payment_methods:
-        for option in dataset.payment_options.get(request.request_id, ()):
-            schedule = tuple(payment_schedule(option))
-            if (option.payment_method != "installments" or not schedule
-                    or (profile.max_installment_months is not None and option.number_of_payments > profile.max_installment_months)
-                    or schedule[-1][0] > request.desired_completion_date):
-                continue
-            if is_safe(simulate_cash_flow(profile, [*baseline_flows, *plan_flows(schedule)], request.request_date), profile):
-                candidates.append(PaymentCandidate("affordable_with_plan", "installments", schedule, earliest,
-                                                   option.payment_option_id,
-                                                   f"Baseline selected supplied installment option {option.payment_option_id}."))
+    for evaluation in evaluate_installment_options(dataset, request, baseline_flows):
+        if evaluation.accepted:
+            candidates.append(PaymentCandidate("affordable_with_plan", "installments", evaluation.schedule, earliest,
+                                               evaluation.option.payment_option_id,
+                                               f"Baseline selected supplied installment option "
+                                               f"{evaluation.option.payment_option_id}."))
 
     if (request.allows_partial_payment and "partial_payment" in profile.payment_methods
             and MONEY_ZERO < safe_amount < request.requested_amount and earliest is not None
@@ -1547,6 +1628,16 @@ def trace_request(dataset: Dataset, request: Request) -> str:
     earliest = earliest_safe_full_payment(dataset, request, flows)
     candidates = payment_candidates(dataset, request, flows, safe_amount, earliest)
     selected = choose_payment_candidate(candidates, request)
+    option_evaluations = evaluate_installment_options(dataset, request, flows)
+    lines.extend(["", "## Payment-option evaluation", ""])
+    if option_evaluations:
+        lines.extend(
+            f"- `{evaluation.option.payment_option_id}`: {'accepted' if evaluation.accepted else 'rejected'}; "
+            f"{evaluation.reason}."
+            for evaluation in option_evaluations
+        )
+    else:
+        lines.append("- No supplied installment options.")
     lines.extend(["", "## Safe no-change payment candidates", ""])
     if candidates:
         for candidate in sorted(candidates, key=lambda candidate: candidate_rank(candidate, request)):
