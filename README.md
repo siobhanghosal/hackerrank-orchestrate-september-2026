@@ -68,6 +68,26 @@ field changes. The final full-dataset command overwrites
 `code/evaluation/usage_report.md` with local input/output token counts and
 zero API cost.
 
+### Optional offline OCR for linked financial documents
+
+When an event amount is blank, the supplied linked document may contain the
+amount. Install the packaged local OCR dependency once:
+
+```bash
+python -m pip install -r code/requirements.txt
+```
+
+Then enable it explicitly for the final run:
+
+```bash
+python code/main.py --image-evidence-provider rapidocr --write-output output.csv
+```
+
+OCR may amend only a blank amount on the event named by `images.csv`. The CSV
+still supplies the event identity, currency, cash date, and direction. An
+ambiguous, missing, or invalid OCR result is ignored and appears in the audit;
+it never becomes a new payment instruction or financial event.
+
 After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
 
 ## Important File Locations

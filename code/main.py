@@ -21,6 +21,7 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Sequence
 
+from image_evidence import ImageAmountExtractor, ImageEvidenceError, RapidOcrImageAmountExtractor
 from ollama_explanations import ExplanationError, ExplanationGenerator, OllamaExplanationGenerator, usage_report_markdown
 
 
@@ -330,6 +331,9 @@ class Dataset:
     exchange_rates: Mapping[tuple[date, str, str], Decimal]
     messages: tuple[Mapping[str, str], ...]
     images: tuple[Mapping[str, str], ...]
+    image_dir: Path | None = None
+    image_facts: tuple[EvidenceFact, ...] = ()
+    image_evidence_notes: tuple[str, ...] = ()
 
 
 def read_csv(path: Path, required_columns: Iterable[str]) -> list[dict[str, str]]:
@@ -465,7 +469,11 @@ def load_dataset(dataset_dir: Path) -> Dataset:
     messages = tuple(read_csv(dataset_dir / "messages.csv", {"message_id", "user_id", "request_id", "related_event_id", "sent_at", "source_type", "message_text"}))
     images = tuple(read_csv(dataset_dir / "images.csv", {"image_id", "user_id", "request_id", "related_event_id"}))
     labels = {row["request_id"]: {column: row[column] for column in OUTPUT_COLUMNS[1:]} for row in sample_rows}
-    return Dataset(profiles, requests, samples, labels, events, {key: tuple(value) for key, value in options_by_request.items()}, exchange_rates, messages, images)
+    return Dataset(
+        profiles, requests, samples, labels, events,
+        {key: tuple(value) for key, value in options_by_request.items()}, exchange_rates, messages, images,
+        dataset_dir / "media" / "images",
+    )
 
 
 MONEY_IN_TEXT = re.compile(r"\b(?P<currency>INR|IDR|EUR|USD|ZAR)\s?(?P<amount>[0-9][0-9,]*(?:\.\d+)?)\b", re.IGNORECASE)
@@ -500,10 +508,86 @@ def credit_is_confirmed(event: FinancialEvent, override: EvidenceFact | None) ->
             and "confirmed" in event.description.casefold() and event.settlement_date is not None)
 
 
+def resolve_linked_image_evidence(dataset: Dataset, extractor: ImageAmountExtractor,
+                                  eligible_image_ids: Iterable[str] | None = None) -> Dataset:
+    """Resolve only blank-amount events through their one-to-one linked document.
+
+    Image text is untrusted.  OCR is therefore allowed to supply only a positive
+    amount, never a date, payment instruction, request recommendation, or new
+    event.  The CSV event supplies identity, currency, direction, and cash date.
+    """
+    if dataset.image_dir is None:
+        raise DatasetError("Image evidence requires a dataset media/images directory")
+    events = {event.event_id: event for event in dataset.events}
+    facts: list[EvidenceFact] = list(dataset.image_facts)
+    notes: list[str] = list(dataset.image_evidence_notes)
+    allowed = set(eligible_image_ids) if eligible_image_ids is not None else None
+    for image in dataset.images:
+        image_id = image["image_id"]
+        if allowed is not None and image_id not in allowed:
+            continue
+        target_id = image["related_event_id"] or None
+        target = events.get(target_id or "")
+        if target is None:
+            notes.append(f"{image_id}: ignored; no linked supplied event")
+            continue
+        if target.user_id != image["user_id"]:
+            notes.append(f"{image_id}: ignored; linked event belongs to another user")
+            continue
+        if target.amount is not None:
+            notes.append(f"{image_id}: ignored; linked event already has an amount")
+            continue
+        if target.direction not in {"credit", "debit"} or not target.currency:
+            notes.append(f"{image_id}: ignored; linked event lacks a cash direction or currency")
+            continue
+        try:
+            extraction = extractor.extract(
+                dataset.image_dir / f"{image_id}.png",
+                direction=target.direction,
+                currency=target.currency,
+                description=target.description,
+            )
+        except ImageEvidenceError as exc:
+            notes.append(f"{image_id}: ignored; {exc}")
+            continue
+        if extraction is None:
+            notes.append(f"{image_id}: ignored; OCR did not find one unambiguous labelled amount")
+            continue
+        if not extraction.amount.is_finite() or extraction.amount <= MONEY_ZERO:
+            notes.append(f"{image_id}: ignored; OCR amount is not a positive finite Decimal")
+            continue
+        if extraction.detected_currency is not None and extraction.detected_currency != target.currency:
+            notes.append(f"{image_id}: ignored; OCR currency {extraction.detected_currency} conflicts with linked event currency {target.currency}")
+            continue
+        cash_date = target.settlement_date or target.event_date
+        facts.append(EvidenceFact(
+            image_id, "image", target.user_id, "amend_event", cash_date, target.event_id,
+            extraction.amount, target.currency, "high",
+            f"{extraction.reason}; OCR confidence {extraction.ocr_confidence}; "
+            f"currency {'matched ' + extraction.detected_currency if extraction.detected_currency else 'taken from linked event'}",
+        ))
+        notes.append(f"{image_id}: applied {target.event_id} amount {money_text(extraction.amount)} {target.currency} "
+                     f"using {extraction.label}")
+    return replace(dataset, image_facts=tuple(facts), image_evidence_notes=tuple(notes))
+
+
+def image_ids_for_requests(dataset: Dataset, requests: Iterable[Request]) -> set[str]:
+    """Limit optional OCR to documents that can affect the active request contexts."""
+    request_rows = tuple(requests)
+    request_ids = {request.request_id for request in request_rows}
+    user_ids = {request.user_id for request in request_rows}
+    event_ids = {event.event_id for event in dataset.events if event.user_id in user_ids}
+    return {
+        image["image_id"] for image in dataset.images
+        if image["request_id"] in request_ids or image["user_id"] in user_ids
+        or image["related_event_id"] in event_ids
+    }
+
+
 def resolve_evidence(dataset: Dataset, user_id: str) -> EvidenceResolution:
     """Extract only explicit, high-confidence textual evidence; never infer from a vague notice."""
     events = {event.event_id: event for event in dataset.events if event.user_id == user_id}
-    facts: list[EvidenceFact] = []
+    facts: list[EvidenceFact] = [fact for fact in dataset.image_facts if fact.user_id == user_id]
     for message in dataset.messages:
         if message["user_id"] != user_id:
             continue
@@ -1752,6 +1836,32 @@ def evidence_regression_checks(dataset: Dataset) -> str:
     return f"Evidence regression checks passed: {checked_facts} high-confidence facts across {len(dataset.samples)} samples.\n"
 
 
+def build_image_evidence_audit(dataset: Dataset) -> str:
+    """Write the facts and safe fallbacks produced by the optional OCR adapter."""
+    facts = [fact for fact in dataset.image_facts if fact.source_kind == "image"]
+    lines = [
+        "# Image evidence audit", "",
+        "This report is generated from linked event IDs and local OCR results. It does not read solved sample outputs.",
+        "", "## Applied facts", "",
+        "| Image | Event | Effective date | Action | Amount | Currency | Confidence | Rule |",
+        "| --- | --- | --- | --- | ---: | --- | --- | --- |",
+    ]
+    for fact in facts:
+        lines.append(
+            f"| `{fact.source_id}` | `{fact.target_event_id or ''}` | {fact.effective_date} | `{fact.action}` | "
+            f"{money_text(fact.amount) if fact.amount is not None else ''} | {fact.currency or ''} | "
+            f"{fact.confidence} | {markdown_cell(fact.reason)} |"
+        )
+    if not facts:
+        lines.append("| — | — | — | — | — | — | — | No linked image amount was accepted. |")
+    lines.extend(["", "## Skipped documents", ""])
+    skipped = [note for note in dataset.image_evidence_notes if "ignored" in note]
+    lines.extend(f"- {note}" for note in skipped)
+    if not skipped:
+        lines.append("- None.")
+    return "\n".join(lines) + "\n"
+
+
 def build_recurrence_reconciliation_audit(dataset: Dataset) -> str:
     """Audit cadence inference and explicit-event reconciliation for every public sample context."""
     sections: list[str] = [
@@ -2067,6 +2177,10 @@ def main() -> None:
     parser.add_argument("--predictions-path", type=Path, default=Path(__file__).resolve().parent / "evaluation" / "sample_baseline_predictions.csv")
     parser.add_argument("--write-discrepancy-report", type=Path, help="Audit an existing sample prediction CSV without running prediction.")
     parser.add_argument("--check-evidence-regressions", action="store_true", help="Run generic evidence-resolution invariants on public sample contexts.")
+    parser.add_argument("--image-evidence-provider", choices=("none", "rapidocr"), default="none",
+                        help="Optional local linked-document OCR; it may amend only validated blank event amounts.")
+    parser.add_argument("--write-image-evidence-audit", type=Path,
+                        help="Write facts and safe fallbacks from the optional image-evidence provider.")
     parser.add_argument("--write-recurrence-audit", type=Path, help="Write cadence and explicit-event reconciliation audit for sample contexts.")
     parser.add_argument("--write-ledger-delta-report", type=Path,
                         help="Write per-request ledger and selector diagnostics for mismatched public samples.")
@@ -2084,6 +2198,23 @@ def main() -> None:
                         help="Write local-model token usage for this invocation (requires --llm-provider ollama).")
     args = parser.parse_args()
     dataset = load_dataset(args.dataset_dir)
+    if args.image_evidence_provider == "rapidocr":
+        try:
+            contexts: Iterable[Request] | None = None
+            if args.write_output:
+                contexts = dataset.requests.values()
+            elif args.evaluate_samples:
+                contexts = dataset.samples.values()
+            elif args.trace:
+                request = dataset.samples.get(args.trace) or dataset.requests.get(args.trace)
+                contexts = (request,) if request is not None else ()
+            elif args.explain:
+                request = dataset.samples.get(args.explain) or dataset.requests.get(args.explain)
+                contexts = (request,) if request is not None else ()
+            eligible_ids = image_ids_for_requests(dataset, contexts) if contexts is not None else None
+            dataset = resolve_linked_image_evidence(dataset, RapidOcrImageAmountExtractor(), eligible_ids)
+        except ImageEvidenceError as exc:
+            raise DatasetError(f"Unable to initialize image evidence: {exc}") from exc
     if args.ollama_timeout_seconds <= 0:
         raise DatasetError("--ollama-timeout-seconds must be positive")
     generator: OllamaExplanationGenerator | None = None
@@ -2113,6 +2244,10 @@ def main() -> None:
         print(f"Wrote discrepancy report: {args.write_discrepancy_report}")
     if args.check_evidence_regressions:
         print(evidence_regression_checks(dataset), end="")
+    if args.write_image_evidence_audit:
+        args.write_image_evidence_audit.parent.mkdir(parents=True, exist_ok=True)
+        args.write_image_evidence_audit.write_text(build_image_evidence_audit(dataset), encoding="utf-8", newline="\n")
+        print(f"Wrote image evidence audit: {args.write_image_evidence_audit}")
     if args.write_recurrence_audit:
         args.write_recurrence_audit.parent.mkdir(parents=True, exist_ok=True)
         args.write_recurrence_audit.write_text(build_recurrence_reconciliation_audit(dataset), encoding="utf-8", newline="\n")
@@ -2142,6 +2277,7 @@ def main() -> None:
         args.write_usage_report.write_text(usage_report_markdown(generator.usages, invocation_requests), encoding="utf-8", newline="\n")
         print(f"Wrote model usage report: {args.write_usage_report}")
     if not (args.trace or args.evaluate_samples or args.write_discrepancy_report or args.check_evidence_regressions
+            or args.write_image_evidence_audit
             or args.write_recurrence_audit or args.write_ledger_delta_report or args.explain or args.write_output
             or args.write_usage_report):
         parser.print_help()

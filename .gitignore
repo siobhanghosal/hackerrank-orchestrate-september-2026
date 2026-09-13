@@ -1,4 +1,26 @@
+# Agent/session state and local Python artifacts
 log.txt
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
+
+# Local planning documents, not submission code
 implementation_plan.md
 orchestrate_prd.md
+
+# Evaluation is required in the code package only for usage_report.md.
+# This explicitly excludes architecture comparisons, every milestone report,
+# all per-request/sample traces, diagnostics, audits, and generated snapshots.
+code/evaluation/*
+!code/evaluation/usage_report.md
+
+# The implementation plan explicitly excludes the local test suite from code.zip.
+code/tests/
+
+# Deliberately NOT ignored: root output.csv, code/, dataset/, README.md, and
+# code/evaluation/usage_report.md are required or useful submission artifacts.
