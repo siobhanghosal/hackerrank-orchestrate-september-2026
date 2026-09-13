@@ -1,11 +1,12 @@
 # Model usage report
 
-No final full-dataset model run has been performed for this checkout yet.
+This report describes the command invocation that wrote it.
 
-Before submission, run the final local Ollama command below. It overwrites
-this file with the provider, model, call count, input/output token totals,
-average tokens per request, and local-runtime cost estimate for that exact run:
-
-```text
-python code/main.py --llm-provider ollama --write-output output.csv --write-usage-report code/evaluation/usage_report.md
-```
+- Provider: `ollama` (local runtime)
+- Model(s): `qwen3:4b-instruct`
+- Model calls: `250` attempted; `155` successful; `95` fallback(s)
+- Input tokens: `52390`
+- Output tokens: `9783`
+- Total tokens: `62173`
+- Average tokens per request: `248.69`
+- Estimated cost: `0` for the local Ollama runtime (hardware/electricity excluded).
